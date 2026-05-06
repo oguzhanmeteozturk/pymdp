@@ -17,6 +17,7 @@ import equinox as eqx
 
 from pymdp.maths import factor_dot, log_stable, stable_entropy, stable_xlogx, spm_wnorm
 from pymdp import utils
+from pymdp import ffi as _ffi
 
 class Policies(eqx.Module):
     """ 
@@ -259,6 +260,55 @@ def update_posterior_policies(
         raise ValueError(
             "use_param_info_gain=True requires at least one of pA or pB."
         )
+
+    # FFI fast path: same fused C++ kernel as the inductive variant, with the
+    # inductive flag off. Dummy I and zero epsilon satisfy the ABI; the kernel
+    # validates their shape but skips inductive precompute when use_inductive=False.
+    if _ffi.can_handle(
+        A_dependencies,
+        B_dependencies,
+        use_param_info_gain,
+        num_factors=len(qs_init),
+        num_modalities=len(A),
+    ):
+        I_dummy = [jnp.zeros((1, q.shape[0]), dtype=jnp.float32) for q in qs_init]
+        eps_dummy = jnp.float32(0.0)
+        # pA/pB are captured by closure rather than threaded through the
+        # custom_vjp args list because the EFE policy gradient is over
+        # qs_init/A/B/C, not over the Dirichlet posterior parameters
+        # (which are updated by infer_parameters separately). The JAX
+        # reference path uses the same captured pA/pB for backward parity.
+        pA_capture = pA if use_param_info_gain else None
+        pB_capture = pB if use_param_info_gain else None
+
+        def _jax_neg_efe(qs_init, A, B, C):
+            fn = partial(
+                compute_neg_efe_policy,
+                qs_init, A, B, C, pA_capture, pB_capture,
+                A_dependencies, B_dependencies,
+                use_utility=use_utility,
+                use_states_info_gain=use_states_info_gain,
+                use_param_info_gain=use_param_info_gain,
+            )
+            return vmap(fn)(policy_matrix)
+
+        def _ffi_neg_efe(qs_init, A, B, C):
+            return _ffi.neg_efe_all_policies_ffi(
+                policy_matrix, qs_init, A, B, C, I_dummy,
+                A_dependencies, B_dependencies,
+                pA=pA_capture,
+                pB=pB_capture,
+                use_utility=use_utility,
+                use_states_info_gain=use_states_info_gain,
+                use_param_info_gain=use_param_info_gain,
+                use_inductive=False,
+                inductive_epsilon=eps_dummy,
+            )
+
+        neg_efe_all_policies = _ffi.with_jax_grad(_ffi_neg_efe, _jax_neg_efe)(
+            qs_init, A, B, C
+        )
+        return nn.softmax(gamma * neg_efe_all_policies + log_stable(E)), neg_efe_all_policies
 
     # policy --> n_levels_factor_f x 1
     # factor --> n_levels_factor_f x n_policies
@@ -809,6 +859,55 @@ def update_posterior_policies_inductive(
         raise ValueError(
             "use_param_info_gain=True requires at least one of pA or pB."
         )
+
+    # FFI fast path: fused C++ kernel runs ~4.5x faster than the JAX vmap on
+    # M3 Max. inductive_epsilon is a runtime 0-d buffer in the kernel, so a
+    # vmap tracer (Agent.infer_policies broadcasts epsilon to (batch_size,))
+    # is fine — the kernel uses vmap_method="broadcast_all" and iterates over
+    # the batch internally. ffi.with_jax_grad routes the gradient backward
+    # through the JAX vmap path since ffi_call has no native JVP rule.
+    if _ffi.can_handle(
+        A_dependencies,
+        B_dependencies,
+        use_param_info_gain,
+        num_factors=len(qs_init),
+        num_modalities=len(A),
+    ):
+        # pA/pB are captured by closure rather than threaded through the
+        # custom_vjp args; same rationale as the non-inductive dispatch above.
+        pA_capture = pA if use_param_info_gain else None
+        pB_capture = pB if use_param_info_gain else None
+
+        def _jax_neg_efe(qs_init, A, B, C, I, eps):
+            fn = partial(
+                compute_neg_efe_policy_inductive,
+                qs_init, A, B, C, pA_capture, pB_capture,
+                A_dependencies, B_dependencies, I,
+                inductive_epsilon=eps,
+                use_utility=use_utility,
+                use_states_info_gain=use_states_info_gain,
+                use_param_info_gain=use_param_info_gain,
+                use_inductive=use_inductive,
+            )
+            return vmap(fn)(policy_matrix)
+
+        def _ffi_neg_efe(qs_init, A, B, C, I, eps):
+            return _ffi.neg_efe_all_policies_ffi(
+                policy_matrix, qs_init, A, B, C, I,
+                A_dependencies, B_dependencies,
+                pA=pA_capture,
+                pB=pB_capture,
+                use_utility=use_utility,
+                use_states_info_gain=use_states_info_gain,
+                use_param_info_gain=use_param_info_gain,
+                use_inductive=use_inductive,
+                inductive_epsilon=eps,
+            )
+
+        neg_efe_all_policies = _ffi.with_jax_grad(_ffi_neg_efe, _jax_neg_efe)(
+            qs_init, A, B, C, I, inductive_epsilon
+        )
+        return nn.softmax(gamma * neg_efe_all_policies + log_stable(E)), neg_efe_all_policies
 
     # policy --> n_levels_factor_f x 1
     # factor --> n_levels_factor_f x n_policies

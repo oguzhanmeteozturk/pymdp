@@ -108,6 +108,35 @@ def run_factorized_fpi(
 
     # Step 2: Map prior to log space and create initial log-posterior
     log_prior = jtu.tree_map(log_stable, prior)
+
+    # FFI fast path: dispatch to the generalized fused-FPI kernel when the
+    # agent matches the supported signature (per-modality dep rank in {1,2,3},
+    # num_iter > 0). Collapses num_iter * (per-iter fused kernel count) XLA
+    # dispatches into one tight C++ loop; the K=3 path keeps the shared-prefix
+    # t01[s0,s1] = sum_{s2} ll[s0,s1,s2] * q[s2] resident across iterations.
+    from pymdp import ffi as _ffi
+    if _ffi.can_handle_fpi(prior, A_dependencies, num_iter):
+        ll_list = list(log_likelihoods)
+        lp_list = list(log_prior)
+
+        def _jax_fpi(ll_list, lp_list):
+            log_q = jtu.tree_map(jnp.zeros_like, lp_list)
+
+            def scan_fn(carry, t):
+                log_q = carry
+                q = jtu.tree_map(nn.softmax, log_q)
+                marginal_ll = all_marginal_log_likelihood(q, ll_list, A_dependencies)
+                log_q = jtu.tree_map(add, marginal_ll, lp_list)
+                return log_q, None
+
+            res, _ = lax.scan(scan_fn, log_q, jnp.arange(num_iter))
+            return jtu.tree_map(nn.softmax, res)
+
+        def _ffi_fpi(ll_list, lp_list):
+            return _ffi.fpi_ffi(ll_list, lp_list, A_dependencies, num_iter)
+
+        return _ffi.with_jax_grad(_ffi_fpi, _jax_fpi)(ll_list, lp_list)
+
     log_q = jtu.tree_map(jnp.zeros_like, prior)
 
     # Step 3: Iterate until convergence
