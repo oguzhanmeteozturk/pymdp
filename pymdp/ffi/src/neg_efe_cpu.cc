@@ -30,6 +30,7 @@
 #include "factor_history_tree.h"
 #include "kernel_primitives.h"
 #include "neg_efe.h"
+#include "neg_efe_entry.h"
 #include "neg_efe_precompute.h"
 
 namespace ffi = ::xla::ffi;
@@ -297,10 +298,9 @@ struct Kernel {
     if (flags.use_param_info_gain) {
       // Cache wA / wB across vmap batch elements (and across calls of the same
       // shape). pA / pB are typically broadcast across batch in
-      // Agent.infer_policies — without this LRU, batch=4 redoes the digamma+log
-      // precompute four times (~3 ms × 4 standalone, measured on Ice Lake-SP).
-      // Cache key reuses a_layout_sig / b_layout_sig because wA / wB layouts
-      // are determined entirely by A / B layouts.
+      // Agent.infer_policies — without this LRU every batch element redoes the
+      // digamma+log precompute. Cache key reuses a_layout_sig / b_layout_sig
+      // because wA / wB layouts are determined entirely by A / B layouts.
       if (in.pA != nullptr) {
         WACache* w = refresh_cache_lru(g_wa_cache_lru, in.pA, L.A_off[L.M], a_layout_sig(L),
                                        [&](WACache& c) { c.wA = precompute_wA(L, in.pA); });
@@ -315,84 +315,19 @@ struct Kernel {
     metas = build_meta_summary(L, *HA, *B_tr);
   }
 
-  // Score one modality-history tuple. `qs_outer_f32` is the Kronecker product
-  // over the modality dependency factors for this tuple.
-  float score_modality_outer(const ModalityMeta& mm, int64_t t, const float* qs_outer_f32, NodeScratch& s) const {
-    float delta = 0.0f;
-
-    // qs_outer_compact_ptr aliases the modality A-path qs_outer on
-    // FfiF16 == float hosts. ARMv8.2/FML builds compact the f32 Kronecker
-    // product into f16 before the A_aug sgemv.
-    const FfiF16* qs_outer_compact_ptr = nullptr;
-    if (mm.state_deps.rank == 0) {
-      // No state dependency: qo is just A_m (a prior over observations).
-      std::memcpy(s.qo_plus_HA.data(), A_data + mm.offsets.A_input, sizeof(float) * mm.O);
-      if (flags.use_states_info_gain) {
-        delta += entropy(s.qo_plus_HA.data(), mm.O) - HA->data[mm.offsets.entropy];
-      }
-    } else {
-#if PYMDP_FFI_HAS_F16_FML
-      for (int64_t k = 0; k < mm.K; ++k) {
-        s.qs_outer_compact[k] = static_cast<FfiF16>(qs_outer_f32[k]);
-      }
-      qs_outer_compact_ptr = s.qs_outer_compact.data();
-      // ARMv8.2 FP16/FML fast path: one fused f16 sgemv yields both qo
-      // (rows 0..O_m-1) and qs_HA (row O_m, when use_states_info_gain is
-      // on) — widening the call avoids a second pass over qs_outer.
-      const int64_t rows = mm.O + (flags.use_states_info_gain ? 1 : 0);
-      sgemv_rm_compact(rows, mm.K, A_aug_compact + mm.offsets.A_aug, mm.K, qs_outer_compact_ptr, s.qo_plus_HA.data());
-      if (flags.use_states_info_gain) {
-        delta += entropy(s.qo_plus_HA.data(), mm.O) - s.qo_plus_HA[mm.O];
-      }
-#else
-      // ARMv8.0 fallback (Cortex-A57 / Jetson Nano): no FP16/FML, no
-      // packed A_aug. Score directly against the f32 source A via
-      // sgemv_rm_f32, then reduce H_A . qs separately via sdot_f32.
-      // Compute cost matches the f16 path exactly ((O+1)*K FMAs); the
-      // win is L2 footprint — measured on Cortex-A57's 2 MB shared L2
-      // where the duplicate A_aug pressures cache enough to regress
-      // batched policy_len=3 fixtures by ~14% vs this split design.
-      static_assert(std::is_same<FfiF16, float>::value, "v8.0 path requires f32 storage");
-      qs_outer_compact_ptr = reinterpret_cast<const FfiF16*>(qs_outer_f32);
-      sgemv_rm_f32(mm.O, mm.K, A_data + mm.offsets.A_input, mm.K, qs_outer_f32, s.qo_plus_HA.data());
-      if (flags.use_states_info_gain) {
-        const float ha_dot = sdot_f32(mm.K, HA->data.data() + mm.offsets.entropy, qs_outer_f32);
-        delta += entropy(s.qo_plus_HA.data(), mm.O) - ha_dot;
-      }
-#endif
-    }
-
-    if (flags.use_utility) {
-      const float* Cm_t = C_data + mm.offsets.C_input + t * mm.O;
-      delta += sdot_f32(mm.O, s.qo_plus_HA.data(), Cm_t);
-    }
-
-    // pA novelty contribution. Mirrors calc_negative_pA_info_gain in
-    // pymdp.control: pA_term = qo . (wA[m] @ qs_outer), where wA encodes
-    // log(Σ pA) - log(pA) + 1/pA - 1/Σ + digamma(pA) - digamma(Σ) (zeroed
-    // where pA == 0). Adding +pA_term to delta matches the JAX `neg_efe -=
-    // neg_param_info_gain` semantics — `_exact_wnorm` already negates wA, and
-    // `factor_dot · qo` adds another sign flip; the net contribution is
-    // positive epistemic value in the policy score.
-    //
-    // Skipped when wA_data is null (pA was None). Rank-0 modalities (no
-    // state dependency) have no Dirichlet-novelty term tied to qs — pA_m
-    // there is just a prior over observations; the JAX reference also
-    // collapses this to a state-independent constant we drop alongside
-    // utility's constant.
-    //
-    // wA is f32 (precompute math needs digamma/log) so it consumes the f32
-    // history Kronecker product even on ARMv8.2/FML hosts where the A path
-    // compacts a copy to f16.
-    if (flags.use_param_info_gain && wA_data != nullptr && mm.state_deps.rank > 0) {
-      sgemv_rm_f32(mm.O, mm.K, wA_data + mm.offsets.A_input, mm.K, qs_outer_f32, s.wa_qs.data());
-      delta += sdot_f32(mm.O, s.qo_plus_HA.data(), s.wa_qs.data());
-    }
-    return delta;
-  }
-
-  float score_modality_compact(const ModalityMeta& mm, int64_t t, const FfiF16* qs_outer_compact,
-                               NodeScratch& s) const {
+  // Score one modality-history tuple.
+  //   * `qs_outer_compact` is the modality dependency Kronecker product packed
+  //     into FfiF16 (on ARMv8.2/FML hosts; on ARMv8.0 hosts FfiF16 == float so
+  //     it can alias an f32 buffer).
+  //   * `qs_outer_f32_or_null` is the same product in f32. Required when
+  //     pA novelty is live (wA is f32 only — digamma/log precompute). Null
+  //     otherwise; pA novelty silently skips.
+  //
+  // The A pass uses qs_outer_compact (FML fast path or v8.0 f32 reinterpret);
+  // pA novelty uses qs_outer_f32_or_null. Rank-0 modalities skip the qs_outer
+  // dependency entirely (qo collapses to A_m).
+  float score_modality(const ModalityMeta& mm, int64_t t, const FfiF16* qs_outer_compact,
+                       const float* qs_outer_f32_or_null, NodeScratch& s) const {
     float delta = 0.0f;
     if (mm.state_deps.rank == 0) {
       std::memcpy(s.qo_plus_HA.data(), A_data + mm.offsets.A_input, sizeof(float) * mm.O);
@@ -401,12 +336,18 @@ struct Kernel {
       }
     } else {
 #if PYMDP_FFI_HAS_F16_FML
+      // ARMv8.2 FP16/FML fast path: one fused f16 sgemv produces qo
+      // (rows 0..O_m-1) and the optional qs_HA scalar (row O_m).
       const int64_t rows = mm.O + (flags.use_states_info_gain ? 1 : 0);
       sgemv_rm_compact(rows, mm.K, A_aug_compact + mm.offsets.A_aug, mm.K, qs_outer_compact, s.qo_plus_HA.data());
       if (flags.use_states_info_gain) {
         delta += entropy(s.qo_plus_HA.data(), mm.O) - s.qo_plus_HA[mm.O];
       }
 #else
+      // ARMv8.0 fallback (Cortex-A57): no FP16/FML, no packed
+      // A_aug. Score directly against the f32 source A then reduce HA · qs
+      // separately. Same FMA count as FML; the win is avoiding an A_aug
+      // copy that pressures Cortex-A57's 2 MB L2.
       static_assert(std::is_same<FfiF16, float>::value, "v8.0 path requires f32 storage");
       const float* qs_outer_f32 = reinterpret_cast<const float*>(qs_outer_compact);
       sgemv_rm_f32(mm.O, mm.K, A_data + mm.offsets.A_input, mm.K, qs_outer_f32, s.qo_plus_HA.data());
@@ -416,9 +357,19 @@ struct Kernel {
       }
 #endif
     }
+
     if (flags.use_utility) {
       const float* Cm_t = C_data + mm.offsets.C_input + t * mm.O;
       delta += sdot_f32(mm.O, s.qo_plus_HA.data(), Cm_t);
+    }
+
+    // pA novelty contribution: pA_term = qo · (wA[m] @ qs_outer). Mirrors
+    // calc_negative_pA_info_gain in pymdp.control; sign-net positive in the
+    // policy score after JAX's negation conventions. Skipped for rank-0
+    // modalities (no state-dependent novelty term).
+    if (flags.use_param_info_gain && wA_data != nullptr && mm.state_deps.rank > 0 && qs_outer_f32_or_null != nullptr) {
+      sgemv_rm_f32(mm.O, mm.K, wA_data + mm.offsets.A_input, mm.K, qs_outer_f32_or_null, s.wa_qs.data());
+      delta += sdot_f32(mm.O, s.qo_plus_HA.data(), s.wa_qs.data());
     }
     return delta;
   }
@@ -439,11 +390,9 @@ struct Kernel {
     // each phase-1 omp for + the explicit phase barrier guarantees visibility).
     next->ptrs.resize(L.F);
     next->histories.resize(L.F);
-    int64_t factor_score_off = 0;
     for (int64_t f = 0; f < L.F; ++f) {
       next->ptrs[f]      = next_storage[f].data();
       next->histories[f] = factors_level[f].n_histories;
-      factor_score_off += factors_level[f].n_histories;
     }
 
     // Decide whether to fire OMP. Two gates that both have to pass:
@@ -492,11 +441,11 @@ struct Kernel {
         if (use_omp) {
 #pragma omp for schedule(static) nowait
           for (int32_t h = 0; h < lv.n_histories; ++h) {
-            score_factor_history(t, lv, fm, f, h, curr, qs_out, factor_scores_f, s);
+            score_factor_history(lv, fm, f, h, curr, qs_out, factor_scores_f, s);
           }
         } else {
           for (int32_t h = 0; h < lv.n_histories; ++h) {
-            score_factor_history(t, lv, fm, f, h, curr, qs_out, factor_scores_f, s);
+            score_factor_history(lv, fm, f, h, curr, qs_out, factor_scores_f, s);
           }
         }
       }
@@ -533,7 +482,6 @@ struct Kernel {
       s.ensure_size(metas.max_O, metas.max_K, metas.max_inner_K_any, metas.max_K_b, metas.max_S);
       run_factor_phase(s, /*use_omp=*/false);
       run_modality_phase(s, /*use_omp=*/false);
-      (void)factor_score_off;  // suppress unused warning in serial branch
       return;
     }
 
@@ -545,13 +493,12 @@ struct Kernel {
 #pragma omp barrier
       run_modality_phase(s, /*use_omp=*/true);
     }
-    (void)factor_score_off;  // pacify the unused-but-set diagnostic on some compilers
   }
 
   // Phase-1 body: rollout factor f's history h from `curr` through B[f, u_h]
   // into qs_out + h*S_f, then accumulate optional pB-novelty + inductive into
   // factor_scores_f[h]. Pure compute; no OMP / cross-thread state.
-  void score_factor_history(int64_t t, const FactorHistoryLevel& lv, const FactorMeta& fm, int64_t f, int32_t h,
+  void score_factor_history(const FactorHistoryLevel& lv, const FactorMeta& fm, int64_t f, int32_t h,
                             const QsLevel& curr, float* qs_out, float* factor_scores_f, NodeScratch& s) const {
     const int32_t* parent_h = lv.parent_histories.data() + static_cast<int64_t>(h) * lv.n_parents;
     const int32_t  u        = lv.action_per_history[h];
@@ -571,12 +518,12 @@ struct Kernel {
       score += sdot_f32(fm.S, inductive.data.data() + L.qs_off[f], qs_next_f);
     }
     factor_scores_f[h] = score;
-    (void)t;
   }
 
-  // Phase-2 body: score one (m, idx) modality history tuple. Builds qs_outer
-  // from `qs_next` (filled in Phase 1) using either the f16 compact path or
-  // the f32 outer path when use_param_info_gain is on.
+  // Phase-2 body: score one (m, idx) modality history tuple. When pA novelty
+  // is live, we build the f32 Kronecker product and pack a compact view of it
+  // for the A pass; otherwise we go straight to the compact build (saves the
+  // f32 buffer trip).
   void score_modality_entry(int64_t t, const ModalityMeta& mm, const DependencyView& deps, const QsLevel& qs_next,
                             const FactorHistoryTables& tables, int64_t idx, int64_t tuple_base, const int64_t* strides,
                             float* score_m, NodeScratch& s) const {
@@ -587,16 +534,24 @@ struct Kernel {
     } else {
       decode_history_tuple(idx, strides, deps.rank, histories.data());
     }
-    if (flags.use_param_info_gain && wA_data != nullptr && deps.rank > 0) {
-      const float* qs_outer =
+    const bool pa_path = flags.use_param_info_gain && wA_data != nullptr && deps.rank > 0;
+    if (pa_path) {
+      const float* qs_outer_f32 =
           build_qs_outer_history(L, deps, qs_next, histories.data(), kMaxFfiDependencyRank, s.interm_f32.data(),
                                  s.interm_spare.data(), s.qs_outer_a_f32.data());
-      score_m[idx] = score_modality_outer(mm, t, qs_outer, s);
+#if PYMDP_FFI_HAS_F16_FML
+      for (int64_t k = 0; k < mm.K; ++k) s.qs_outer_compact[k] = static_cast<FfiF16>(qs_outer_f32[k]);
+      const FfiF16* qs_outer_compact = s.qs_outer_compact.data();
+#else
+      static_assert(std::is_same<FfiF16, float>::value, "v8.0 path requires f32 storage");
+      const FfiF16* qs_outer_compact = reinterpret_cast<const FfiF16*>(qs_outer_f32);
+#endif
+      score_m[idx] = score_modality(mm, t, qs_outer_compact, qs_outer_f32, s);
     } else {
-      const FfiF16* qs_outer =
+      const FfiF16* qs_outer_compact =
           build_qs_outer_history_typed<FfiF16>(L, deps, qs_next, histories.data(), kMaxFfiDependencyRank,
                                                s.interm_f32.data(), s.interm_spare.data(), s.qs_outer_compact.data());
-      score_m[idx] = score_modality_compact(mm, t, qs_outer, s);
+      score_m[idx] = score_modality(mm, t, qs_outer_compact, nullptr, s);
     }
   }
 };
@@ -625,7 +580,15 @@ inline void scatter_factor_history(const Layout& L, const FactorHistoryTables& t
     out_data[p] = sum;
   };
 
-  if (L.P < kOmpNodeThreshold) {
+  // Scatter is L.P * L.T * (L.M + L.F) trivial float adds — for agent_step
+  // (L.P=24, L.T=1, L.M+L.F=6 → 144 adds) the libgomp fork+barrier dwarfs the
+  // work, so an L.P-only gate misses the regression on ARMv8.0 hosts where
+  // kOmpNodeThreshold=8 lets 24 policies fire parallel. Combine an absolute
+  // op-count gate with the host's L.P threshold so big inductive fixtures
+  // (L.P=1728, L.T=3, L.M+L.F=6 → 31K) still parallelize.
+  constexpr int64_t kNegEfeScatterOmpWorkThreshold = 4096;
+  const int64_t     scatter_work                   = L.P * L.T * (L.M + L.F);
+  if (scatter_work < kNegEfeScatterOmpWorkThreshold || L.P < kOmpNodeThreshold) {
     for (int64_t p = 0; p < L.P; ++p) {
       scatter_one_policy(p);
     }
@@ -693,26 +656,14 @@ FfiError NegEfeCpu(FfiS32Buf policy_matrix, FfiF32Buf qs_init, FfiF32Buf A, FfiF
   const LayoutSpans spans{S_span,         O_span,          U_span,        qs_off_span,   A_off_span,
                           B_off_span,     C_off_span,      I_off_span,    I_depths_span, A_dep_flat_span,
                           A_dep_off_span, B_dep_flat_span, B_dep_off_span};
-  CallShape         shape{};
-  Layout            L{};
-  PYMDP_TRY(parse_neg_efe_layout(policy_matrix, spans, &shape, &L));
-
-  BufferStrides strides{};
-  EpsilonLayout epsilon{};
-  PYMDP_TRY(validate_neg_efe_runtime(shape, L, policy_matrix, qs_init, A, B, C, I, inductive_epsilon, out, &strides,
-                                     &epsilon));
+  ParsedCall        pc;
+  PYMDP_TRY(
+      parse_and_validate_call(policy_matrix, qs_init, A, B, C, I, pA, pB, inductive_epsilon, out, spans, flags, &pc));
 
   // Layout invariants from validate_layout / parse_call_shape — restate so the
   // optimizer can drop zero-trip guards across the per-batch loop and downstream
   // process_batch_element / Kernel inlining boundary.
-  if (L.F <= 0 || L.M <= 0 || L.P <= 0 || L.T <= 0 || shape.Bn <= 0) __builtin_unreachable();
-
-  const KernelFlags parsed_flags = KernelFlags::from_bits(flags);
-  PYMDP_TRY(validate_neg_efe_param_info_gain_buffers(parsed_flags.use_param_info_gain, shape.Bn, strides,
-                                                     pA.element_count(), pB.element_count()));
-  const bool param_info_gain = parsed_flags.use_param_info_gain;
-  const bool pA_present      = pA.element_count() > 0;
-  const bool pB_present      = pB.element_count() > 0;
+  if (pc.L.F <= 0 || pc.L.M <= 0 || pc.L.P <= 0 || pc.L.T <= 0 || pc.shape.Bn <= 0) __builtin_unreachable();
 
   const int32_t* pm_base  = policy_matrix.typed_data();
   const float*   qs_base  = qs_init.typed_data();
@@ -727,16 +678,14 @@ FfiError NegEfeCpu(FfiS32Buf policy_matrix, FfiF32Buf qs_init, FfiF32Buf A, FfiF
   const float* pB_base = pB.typed_data();
 
   KernelTimer timer([&](double us) {
-    std::fprintf(stderr, "[efe] Bn=%lld P=%lld T=%lld F=%lld M=%lld | total=%6.2f us\n", (long long)shape.Bn,
-                 (long long)L.P, (long long)L.T, (long long)L.F, (long long)L.M, us);
+    std::fprintf(stderr, "[efe] Bn=%lld P=%lld T=%lld F=%lld M=%lld | total=%6.2f us\n", (long long)pc.shape.Bn,
+                 (long long)pc.L.P, (long long)pc.L.T, (long long)pc.L.F, (long long)pc.L.M, us);
   });
-
-  const bool use_inductive_flag = parsed_flags.use_inductive;
 
   // Hoist all epsilon validation out of the parallel region. Cheap (Bn small),
   // and lets workers run pure compute without per-batch error returns.
-  if (use_inductive_flag) {
-    PYMDP_TRY(validate_inductive_epsilons_batched(eps_base, shape, epsilon));
+  if (pc.flags.use_inductive) {
+    PYMDP_TRY(validate_inductive_epsilons_batched(eps_base, pc.shape, pc.epsilon));
   }
 
   // Batch parallelism: each worker accesses its own thread_local CallScratch
@@ -749,43 +698,43 @@ FfiError NegEfeCpu(FfiS32Buf policy_matrix, FfiF32Buf qs_init, FfiF32Buf A, FfiF
   // heavy leaf-level scoring (~1728 entries). With nested OMP off in
   // libgomp/libomp, firing the outer batch loop for Bn<cores collapses each
   // batch element to a single core and serializes that leaf-level work —
-  // measured ~65% slower on the Bn=4 inductive fixture.
+  // a large regression on the Bn=4 inductive fixture.
   //
   // Explicit serial/parallel split (not `omp parallel if(...)`) so the small-
   // batch path never enters the OMP runtime: an `if(false)` region still
   // creates a 1-thread team and pays libomp bookkeeping.
   FfiError   first_error      = FfiError::Success();
-  const bool parallel_batches = shape.Bn >= kOmpNodeThreshold;
+  const bool parallel_batches = pc.shape.Bn >= kOmpNodeThreshold;
 
   // pA / pB pointers stay nullptr unless the kernel was invoked with
   // use_param_info_gain AND the corresponding buffer is non-empty; the
   // Kernel ctor branches on nullptr to skip wA / wB precompute work.
   auto make_batch_inputs = [&](int64_t b) -> BatchInputs {
-    return {pm_base + b * strides.pm,
-            qs_base + b * strides.qs,
-            A_base + b * strides.A,
-            B_base + b * strides.B,
-            C_base + b * strides.C,
-            I_base + b * strides.I,
-            (param_info_gain && pA_present) ? pA_base + b * strides.A : nullptr,
-            (param_info_gain && pB_present) ? pB_base + b * strides.B : nullptr,
-            eps_base[epsilon.batched ? b : 0],
-            out_base + b * strides.out};
+    return {pm_base + b * pc.strides.pm,
+            qs_base + b * pc.strides.qs,
+            A_base + b * pc.strides.A,
+            B_base + b * pc.strides.B,
+            C_base + b * pc.strides.C,
+            I_base + b * pc.strides.I,
+            (pc.flags.use_param_info_gain && pc.pA_present) ? pA_base + b * pc.strides.A : nullptr,
+            (pc.flags.use_param_info_gain && pc.pB_present) ? pB_base + b * pc.strides.B : nullptr,
+            eps_base[pc.epsilon.batched ? b : 0],
+            out_base + b * pc.strides.out};
   };
 
   if (!parallel_batches) {
     CallScratch& sc_thread = g_call_scratch;
-    for (int64_t b = 0; b < shape.Bn; ++b) {
-      FfiError err = process_batch_element(L, flags, make_batch_inputs(b), sc_thread);
+    for (int64_t b = 0; b < pc.shape.Bn; ++b) {
+      FfiError err = process_batch_element(pc.L, flags, make_batch_inputs(b), sc_thread);
       if (err.failure() && !first_error.failure()) first_error = err;
     }
   } else {
-#pragma omp parallel num_threads(static_cast<int>(std::min<int64_t>(shape.Bn, omp_team_size())))
+#pragma omp parallel num_threads(static_cast<int>(std::min<int64_t>(pc.shape.Bn, omp_team_size())))
     {
       CallScratch& sc_thread = g_call_scratch;
 #pragma omp for schedule(static)
-      for (int64_t b = 0; b < shape.Bn; ++b) {
-        FfiError err = process_batch_element(L, flags, make_batch_inputs(b), sc_thread);
+      for (int64_t b = 0; b < pc.shape.Bn; ++b) {
+        FfiError err = process_batch_element(pc.L, flags, make_batch_inputs(b), sc_thread);
         if (err.failure()) {
 #pragma omp critical
           {

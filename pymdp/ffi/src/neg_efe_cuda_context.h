@@ -62,6 +62,13 @@ struct CudaArrayCache {
   bool match_devptr(const void* dev, int64_t sz, uint64_t sig) const {
     return key.match_devptr(dev, sz, sig) && !arrays.empty();
   }
+  // Cache hit + refresh of the stored devptr. Callers use this as a
+  // single-expression early-return in the per-call fill helpers.
+  bool match_and_touch(uint64_t tag, int64_t sz, uint64_t sig, const void* dev_src) {
+    if (!match(tag, sz, sig)) return false;
+    key.last_devptr = dev_src;
+    return true;
+  }
   void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built, const void* dev_src = nullptr) {
     pool   = std::move(built_pool);
     arrays = std::move(built);
@@ -83,6 +90,11 @@ struct CudaACache {
   bool match(uint64_t tag, int64_t sz, uint64_t sig) const { return key.match(tag, sz, sig) && !arrays.empty(); }
   bool match_devptr(const void* dev, int64_t sz, uint64_t sig) const {
     return key.match_devptr(dev, sz, sig) && !arrays.empty();
+  }
+  bool match_and_touch(uint64_t tag, int64_t sz, uint64_t sig, const void* dev_src) {
+    if (!match(tag, sz, sig)) return false;
+    key.last_devptr = dev_src;
+    return true;
   }
   void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built, CuArrVec built_cublas,
              const void* dev_src = nullptr) {
@@ -116,6 +128,12 @@ struct CudaLinearCache {
   bool match_devptr(const void* a_dev, const void* c_dev, uint64_t sig, int32_t fl) const {
     return valid && a_dev != nullptr && last_a_devptr == a_dev && last_c_devptr == c_dev && layout_sig == sig &&
            flags == fl;
+  }
+  bool match_and_touch(uint64_t a, uint64_t c, uint64_t sig, int32_t fl, const void* a_dev, const void* c_dev) {
+    if (!match(a, c, sig, fl)) return false;
+    last_a_devptr = a_dev;
+    last_c_devptr = c_dev;
+    return true;
   }
   void store_empty(uint64_t a, uint64_t c, uint64_t sig, int32_t fl, const void* a_dev, const void* c_dev) {
     a_tag         = a;
@@ -163,6 +181,11 @@ struct FactorHistoryCache {
   bool match_devptr(const void* dev, int64_t sz, uint64_t sig) const {
     return key.match_devptr(dev, sz, sig) && !factor_tree.empty();
   }
+  bool match_and_touch(uint64_t tag, int64_t sz, uint64_t sig, const void* dev_src) {
+    if (!match(tag, sz, sig)) return false;
+    key.last_devptr = dev_src;
+    return true;
+  }
 };
 
 using CudaTreeCache = FactorHistoryCache;
@@ -187,9 +210,12 @@ inline thread_local std::vector<float> g_cuda_host_pack_scratch;
 inline thread_local std::vector<float> g_cuda_host_pack_scratch_alt;
 
 struct CublasHandleHolder {
-  cublasHandle_t handle = nullptr;
+  cublasHandle_t handle       = nullptr;
+  cudaStream_t   bound_stream = nullptr;  // last stream cublasSetStream-set
   ~CublasHandleHolder() {
-    if (handle) cublasDestroy(handle);
+    // Mirror CuArr::reset's process-exit guard — see cuda_runtime_unloading
+    // in neg_efe_cuda_memory.h for the Tegra teardown-race rationale.
+    if (handle && !cuda_runtime_unloading()) cublasDestroy(handle);
   }
 };
 

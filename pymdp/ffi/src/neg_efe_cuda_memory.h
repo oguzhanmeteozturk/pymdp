@@ -45,6 +45,21 @@ inline size_t round_up_8(size_t n) {
   return (n + 7) & ~static_cast<size_t>(7);
 }
 
+// True if the CUDA runtime is currently unloading. Destructor cleanup order
+// at process exit isn't fixed — static / thread_local / FFI-state-owned
+// destructors can fire after the CUDA runtime has begun shutdown, at which
+// point cudaFree / cublasDestroy on managed pointers can SEGV on Tegra
+// (managed-memory teardown + early-driver-unload race on Tegra at process
+// exit). When this returns true, skip
+// the cleanup — the OS reclaims everything when the process dies. Probing
+// the runtime via cudaGetDevice is the canonical signal: it returns
+// cudaErrorCudartUnloading once the unload flag is set.
+inline bool cuda_runtime_unloading() noexcept {
+  int               dev = -1;
+  const cudaError_t rc  = cudaGetDevice(&dev);
+  return rc == cudaErrorCudartUnloading;
+}
+
 struct CuArr {
   void*  ptr   = nullptr;
   size_t bytes = 0;
@@ -81,7 +96,7 @@ struct CuArr {
   ~CuArr() { reset(); }
 
   void reset() {
-    if (ptr && owns) {
+    if (ptr && owns && !cuda_runtime_unloading()) {
       cudaFree(ptr);
     }
     ptr   = nullptr;

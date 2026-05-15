@@ -36,11 +36,13 @@
 
 #include "xla/ffi/api/ffi.h"
 
+#include "cuda_host_alias.h"
 #include "factor_history_tables.h"
 #include "factor_history_tree.h"
 #include "neg_efe_cuda_context.h"
 #include "neg_efe_cuda_kernels.h"
 #include "neg_efe_cuda_memory.h"
+#include "neg_efe_entry.h"
 #include "neg_efe_layout.h"
 #include "neg_efe_precompute.h"
 #include "error_helpers.h"
@@ -72,18 +74,33 @@ inline size_t tm_index(int t, int m, int M) {
   return static_cast<size_t>(t) * M + m;
 }
 
+// True when B-novelty (per-(t, f) factor_scores) is live for this call.
+// pA-only novelty leaves wb_cache empty — skip rather than zero-and-read.
+inline bool needs_factor_scores(const NegEfeContext& ctx, KernelFlags flags) {
+  return flags.use_param_info_gain && !ctx.wb_cache.arrays.empty();
+}
+
 inline size_t tm_rank_dim_index(int t, int m, int i, int M) {
   return tm_index(t, m, M) * cuda_kernels::kRankMax + i;
 }
 
 // Per-call invariants threaded through run_forward and its launch helpers.
 // Cache-fill and upload helpers are a separate phase and don't take this.
+//
+// `out_dev_ptr` is the device-side scatter destination. Host path: points
+// at ctx.scratch.out_dev (owned managed buffer that gets D2H-copied to the
+// host out buffer at the end). Dev path: points directly at JAX's output
+// device buffer — JAX retains ownership, this code only writes through it.
+// Storing JAX's pointer inside `ctx.scratch.out_dev` via CuArr::view used
+// to invite ensure()/reset() to act on a non-owned buffer; threading the
+// raw pointer here keeps that machinery clear of external memory entirely.
 struct StageCtx {
   NegEfeContext& ctx;
   const Layout&  L;
   KernelFlags    flags;
   int            Bn;
   cudaStream_t   stream;
+  float*         out_dev_ptr;
 };
 
 inline CuArr append_packed_slices(CuPool* pool, std::vector<float>* scratch, const float* base, int Bn,
@@ -114,6 +131,63 @@ inline CuArr append_rank3_cublas_view(CuPool* pool, const std::vector<float>& pa
   return pool->append_copy(cublas_packed->data(), cublas_packed->size() * sizeof(float));
 }
 
+// Bytes needed in a CuPool for an A-shaped pack: per-modality A (always) +
+// rank-3 cuBLAS-permuted view (same size as A, rank-3 modalities only).
+inline size_t a_pack_pool_bytes(const Layout& L, int Bn) {
+  size_t total = 0;
+  for (int m = 0; m < static_cast<int>(L.M); ++m) {
+    const size_t per_batch_bytes = static_cast<size_t>(Bn) * a_size(L, m) * sizeof(float);
+    total += round_up_8(per_batch_bytes);
+    if (modality_state_deps(L, m).rank == 3) total += round_up_8(per_batch_bytes);
+  }
+  return total;
+}
+
+// Bytes needed in a CuPool for a B-shaped pack: per-factor B.
+inline size_t b_pack_pool_bytes(const Layout& L, int Bn) {
+  size_t total = 0;
+  for (int f = 0; f < static_cast<int>(L.F); ++f) {
+    total += round_up_8(static_cast<size_t>(Bn) * b_size(L, f) * sizeof(float));
+  }
+  return total;
+}
+
+// Pack per-modality A-shaped data from `src` (laid out [Bn, sum_m a_size(m)])
+// into the pool. `arrays` gets one CuArr per modality; `cublas_views` gets a
+// rank-3-permuted view for rank-3 modalities (default-constructed slot for
+// others so indices line up with `arrays`).
+void pack_a_modalities(const Layout& L, int Bn, const float* src, CuPool* pool, CuArrVec* arrays,
+                       CuArrVec* cublas_views, std::vector<float>* pack_scratch, std::vector<float>* cublas_scratch) {
+  const int M = static_cast<int>(L.M);
+  arrays->reserve(M);
+  cublas_views->reserve(M);
+  for (int m = 0; m < M; ++m) {
+    const size_t per_batch = a_size(L, m);
+    arrays->push_back(append_packed_slices(pool, pack_scratch, src, Bn, L.A_off[L.M], L.A_off[m], per_batch));
+    const DependencyView deps = modality_state_deps(L, m);
+    if (deps.rank == 3) {
+      const int O_m     = static_cast<int>(L.O[m]);
+      const int S_split = dep_state_size(L, deps, 2);
+      const int S0      = dep_state_size(L, deps, 0);
+      const int S1      = dep_state_size(L, deps, 1);
+      cublas_views->push_back(
+          append_rank3_cublas_view(pool, *pack_scratch, Bn, O_m, S0 * S1, S_split, per_batch, cublas_scratch));
+    } else {
+      cublas_views->emplace_back();
+    }
+  }
+}
+
+// Pack per-factor B-shaped data from `src` (laid out [Bn, sum_f b_size(f)]).
+void pack_b_factors(const Layout& L, int Bn, const float* src, CuPool* pool, CuArrVec* arrays,
+                    std::vector<float>* pack_scratch) {
+  const int F = static_cast<int>(L.F);
+  arrays->reserve(F);
+  for (int f = 0; f < F; ++f) {
+    arrays->push_back(append_packed_slices(pool, pack_scratch, src, Bn, L.B_off[L.F], L.B_off[f], b_size(L, f)));
+  }
+}
+
 // Computes row-major out[b, m, n] = a_rm[b, m, k] @ q01_outer[b, k, n].
 // The cuBLAS call is column-major, so the GEMM is expressed as C^T = Q^T @ A^T.
 FfiError run_batched_q01_gemm(const StageCtx& stage, const char* op, const float* q01_outer, const float* a_rm,
@@ -127,21 +201,118 @@ FfiError run_batched_q01_gemm(const StageCtx& stage, const char* op, const float
   return FfiError::Success();
 }
 
-// Linear cache sig: A's layout (per-(b, m, o, ...) shape) + T (for the
-// per-(t, m) sliced extent) + Bn. Independent of C's per-modality O sig
-// (C_tag captures content already, and the K_m dimension follows A).
+// Row-major tmp_lin[b, h, s] = sum_k q01_outer[b, k, h] * linear[b, k, s].
+// cuBLAS reads q01_outer as col-major [H_kk, K_keep] under OP_T, linear as
+// col-major [S_split, K_keep] under OP_N; the col-major [S_split, H_kk]
+// output is bytewise row-major [H_kk, S_split]. Caller gates on H_kk —
+// dispatch beats the per-(b, h, s) serial-K kernel at H_kk >= ~32 on sm_53.
+FfiError run_batched_tmp_lin_gemm(const StageCtx& stage, const float* q01_outer, const float* linear, float* tmp_lin,
+                                  int K_keep, int H_kk, int S_split) {
+  const float alpha = 1.0f;
+  const float beta  = 0.0f;
+  CUBLAS_TRY("rank-3 tmp_lin GEMM",
+             cublasSgemmStridedBatched(stage.ctx.cublas_handle.handle, CUBLAS_OP_N, CUBLAS_OP_T, S_split, H_kk, K_keep,
+                                       &alpha, linear, S_split, static_cast<long long>(K_keep) * S_split, q01_outer,
+                                       H_kk, static_cast<long long>(K_keep) * H_kk, &beta, tmp_lin, S_split,
+                                       static_cast<long long>(H_kk) * S_split, stage.Bn));
+  return FfiError::Success();
+}
+
+// Linear cache sig: A layout + T + Bn. C_tag captures C's content, K_m
+// follows A — both are subsumed by A_sig.
 inline uint64_t cuda_linear_sig(const Layout& L, int Bn) {
   return mix64(a_sig_bn(L, Bn), static_cast<uint64_t>(L.T));
 }
 
-// =============================================================================
-// Cache fill runs every call; cache hits are just hashing and equality checks.
-// prepare_caches drives these helpers in dependency order.
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Per-call cache fills. prepare_caches() drives them in dependency order;
+// each helper short-circuits on a content-tag + layout-sig hit.
+// -----------------------------------------------------------------------------
 
-// Tree cache: per-(t, f) factor-history dedup + all dependent index tables
+// Per-(t, f) parent/action history bytes (without final-scatter or metadata).
+inline size_t factor_history_pool_bytes(const FactorHistoryLevels& ftree, int T, int F) {
+  size_t total = 0;
+  for (int t = 0; t < T; ++t) {
+    for (int f = 0; f < F; ++f) {
+      const FactorHistoryLevel& lv = ftree[t][f];
+      total += round_up_8(static_cast<size_t>(lv.n_histories) * lv.n_parents * sizeof(int32_t));
+      total += round_up_8(static_cast<size_t>(lv.n_histories) * sizeof(int32_t));
+    }
+  }
+  return total;
+}
+
+// Total bytes for the tree cache's pool: history grids + four final-scatter
+// tables + four per-factor [F] int32 metadata arrays.
+inline size_t tree_pool_bytes(const FactorHistoryLevels& ftree, const FactorHistoryTables& tables, int T, int F) {
+  size_t total = factor_history_pool_bytes(ftree, T, F);
+  total += round_up_8(tables.policy_to_modality_idx.size() * sizeof(int32_t));
+  total += round_up_8(tables.factor_policy_to_history.size() * sizeof(int32_t));
+  total += round_up_8(tables.mod_score_offsets.size() * sizeof(int64_t));
+  total += round_up_8(tables.factor_score_offsets.size() * sizeof(int64_t));
+  total += 4 * round_up_8(static_cast<size_t>(F) * sizeof(int32_t));
+  return total;
+}
+
+// Copy each per-(t, f) parent_history / action_per_history block into `pool`,
+// returning two CuArrGrid2D[T][F] grids. CuArr is move-only so the outer/
+// inner vectors are resized in two passes rather than constructor-initialized.
+void pack_factor_history_grids(const FactorHistoryLevels& ftree, int T, int F, CuPool* pool, CuArrGrid2D* parent_views,
+                               CuArrGrid2D* action_views) {
+  parent_views->resize(T);
+  action_views->resize(T);
+  for (int t = 0; t < T; ++t) {
+    (*parent_views)[t].resize(F);
+    (*action_views)[t].resize(F);
+    for (int f = 0; f < F; ++f) {
+      const FactorHistoryLevel& lv   = ftree[t][f];
+      const size_t              p_sz = static_cast<size_t>(lv.n_histories) * lv.n_parents * sizeof(int32_t);
+      const size_t              a_sz = static_cast<size_t>(lv.n_histories) * sizeof(int32_t);
+      (*parent_views)[t][f]          = pool->append_copy(lv.parent_histories.data(), p_sz);
+      (*action_views)[t][f]          = pool->append_copy(lv.action_per_history.data(), a_sz);
+    }
+  }
+}
+
+// Per-factor metadata arrays consumed by the v_full kernel.
+struct FactorMetaPack {
+  CuArr   S_dev;
+  CuArr   depth_dev;
+  CuArr   qs_off_dev;
+  CuArr   I_off_dev;
+  int64_t I_per_batch = 0;
+};
+
+FactorMetaPack pack_factor_metadata(const Layout& L, int F, CuPool* pool) {
+  std::vector<int32_t> S_arr(F), depth_arr(F), qs_off_arr(F), I_off_arr(F);
+  FactorMetaPack       out;
+  for (int f = 0; f < F; ++f) {
+    S_arr[f]      = static_cast<int32_t>(L.S[f]);
+    depth_arr[f]  = static_cast<int32_t>(L.I_depths[f]);
+    qs_off_arr[f] = static_cast<int32_t>(L.qs_off[f]);
+    I_off_arr[f]  = static_cast<int32_t>(L.I_off[f]);
+    out.I_per_batch += static_cast<int64_t>(L.I_depths[f]) * L.S[f];
+  }
+  const size_t meta_bytes = static_cast<size_t>(F) * sizeof(int32_t);
+  out.S_dev               = pool->append_copy(S_arr.data(), meta_bytes);
+  out.depth_dev           = pool->append_copy(depth_arr.data(), meta_bytes);
+  out.qs_off_dev          = pool->append_copy(qs_off_arr.data(), meta_bytes);
+  out.I_off_dev           = pool->append_copy(I_off_arr.data(), meta_bytes);
+  return out;
+}
+
+// True when all batches of pm_base hold the same per-batch payload.
+inline bool pm_is_broadcast(const int32_t* pm_base, int Bn, int P, int T, int F) {
+  const size_t per_batch_bytes = static_cast<size_t>(P) * T * F * sizeof(int32_t);
+  for (int b = 1; b < Bn; ++b) {
+    if (std::memcmp(pm_base + static_cast<size_t>(b) * P * T * F, pm_base, per_batch_bytes) != 0) return false;
+  }
+  return true;
+}
+
+// Tree cache: per-(t, f) factor-history dedup + dependent index tables
 // (mod_offs, ind_offs, mod_h_dims, pmi, p2h_concat, scratch sizings).
-// Cache key spans [Bn, P, T, F]; broadcast precondition is enforced on miss.
+// Broadcast precondition (pm equal across batch) is enforced on miss.
 FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int32_t* pm_base,
                          const void* pm_dev_src = nullptr) {
   const int      P              = static_cast<int>(L.P);
@@ -151,18 +322,10 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
   const uint64_t pm_tag         = content_tag(reinterpret_cast<const float*>(pm_base), pm_size_floats);
   const uint64_t pm_sig         = factor_history_pm_sig(L);
 
-  if (ctx.tree_cache.match(pm_tag, pm_size_floats, pm_sig)) {
-    ctx.tree_cache.key.last_devptr = pm_dev_src;
-    return FfiError::Success();
-  }
+  if (ctx.tree_cache.match_and_touch(pm_tag, pm_size_floats, pm_sig, pm_dev_src)) return FfiError::Success();
 
-  // Cache miss: enforce the broadcast precondition (tree dedup runs against
-  // batch 0 only). On cache hit we trust pm_tag covering the whole region.
-  const size_t pm_per_batch_bytes = static_cast<size_t>(P) * T * F * sizeof(int32_t);
-  for (int b = 1; b < Bn; ++b) {
-    if (std::memcmp(pm_base + static_cast<size_t>(b) * P * T * F, pm_base, pm_per_batch_bytes) != 0) {
-      return invalid_arg(kEfeKernelName, "CUDA path requires broadcast policy_matrix across batch");
-    }
+  if (!pm_is_broadcast(pm_base, Bn, P, T, F)) {
+    return invalid_arg(kEfeKernelName, "CUDA path requires broadcast policy_matrix across batch");
   }
 
   FactorHistoryLevels ftree;
@@ -171,46 +334,12 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
   FactorHistoryTables tables;
   build_factor_history_tables(L, ftree, &tables, cuda_kernels::kRankMax, Bn);
 
-  // Plan pool: per-(t, f) parent_history + action_per_history, plus the four
-  // final-scatter index buffers. CuPool::append_copy guarantees 8-byte align.
-  size_t total_bytes = 0;
-  for (int t = 0; t < T; ++t) {
-    for (int f = 0; f < F; ++f) {
-      const FactorHistoryLevel& lv           = ftree[t][f];
-      const size_t              parent_bytes = static_cast<size_t>(lv.n_histories) * lv.n_parents * sizeof(int32_t);
-      const size_t              action_bytes = static_cast<size_t>(lv.n_histories) * sizeof(int32_t);
-      total_bytes += round_up_8(parent_bytes) + round_up_8(action_bytes);
-    }
-  }
-  total_bytes += round_up_8(tables.policy_to_modality_idx.size() * sizeof(int32_t));
-  total_bytes += round_up_8(tables.factor_policy_to_history.size() * sizeof(int32_t));
-  total_bytes += round_up_8(tables.mod_score_offsets.size() * sizeof(int64_t));
-  total_bytes += round_up_8(tables.factor_score_offsets.size() * sizeof(int64_t));
-  // Four [F] int32 metadata arrays for the v_full kernel.
-  const size_t factor_meta_bytes = static_cast<size_t>(F) * sizeof(int32_t);
-  total_bytes += 4 * round_up_8(factor_meta_bytes);
-
   CuPool pool;
-  CUDA_TRY("tree_pool_reserve", pool.reserve(total_bytes));
+  CUDA_TRY("tree_pool_reserve", pool.reserve(tree_pool_bytes(ftree, tables, T, F)));
 
-  // CuArr is move-only; can't use CuArrGrid2D(T, CuArrVec(F)) — resize rows separately.
-  CuArrGrid2D parent_views(T);
-  CuArrGrid2D action_views(T);
-  for (int t = 0; t < T; ++t) {
-    parent_views[t].resize(F);
-    action_views[t].resize(F);
-  }
-  for (int t = 0; t < T; ++t) {
-    for (int f = 0; f < F; ++f) {
-      const FactorHistoryLevel& lv           = ftree[t][f];
-      const size_t              parent_bytes = static_cast<size_t>(lv.n_histories) * lv.n_parents * sizeof(int32_t);
-      const size_t              action_bytes = static_cast<size_t>(lv.n_histories) * sizeof(int32_t);
-      parent_views[t][f]                     = pool.append_copy(lv.parent_histories.data(), parent_bytes);
-      action_views[t][f]                     = pool.append_copy(lv.action_per_history.data(), action_bytes);
-    }
-  }
+  CuArrGrid2D parent_views, action_views;
+  pack_factor_history_grids(ftree, T, F, &pool, &parent_views, &action_views);
 
-  // Append the four final-scatter buffers.
   CuArr pmi_dev =
       pool.append_copy(tables.policy_to_modality_idx.data(), tables.policy_to_modality_idx.size() * sizeof(int32_t));
   CuArr p2h_dev = pool.append_copy(tables.factor_policy_to_history.data(),
@@ -220,21 +349,7 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
   CuArr ind_off_dev =
       pool.append_copy(tables.factor_score_offsets.data(), tables.factor_score_offsets.size() * sizeof(int64_t));
 
-  // Per-factor metadata for the v_full kernel: S, depth, qs_off, I_off.
-  // Layout-only — outlives every per-call buffer.
-  std::vector<int32_t> S_arr(F), depth_arr(F), qs_off_arr(F), I_off_arr(F);
-  int64_t              I_per_batch = 0;
-  for (int f = 0; f < F; ++f) {
-    S_arr[f]      = static_cast<int32_t>(L.S[f]);
-    depth_arr[f]  = static_cast<int32_t>(L.I_depths[f]);
-    qs_off_arr[f] = static_cast<int32_t>(L.qs_off[f]);
-    I_off_arr[f]  = static_cast<int32_t>(L.I_off[f]);
-    I_per_batch += static_cast<int64_t>(L.I_depths[f]) * L.S[f];
-  }
-  CuArr factor_S_dev      = pool.append_copy(S_arr.data(), factor_meta_bytes);
-  CuArr factor_depth_dev  = pool.append_copy(depth_arr.data(), factor_meta_bytes);
-  CuArr factor_qs_off_dev = pool.append_copy(qs_off_arr.data(), factor_meta_bytes);
-  CuArr factor_I_off_dev  = pool.append_copy(I_off_arr.data(), factor_meta_bytes);
+  FactorMetaPack meta = pack_factor_metadata(L, F, &pool);
 
   ctx.tree_cache.key.set(pm_tag, pm_size_floats, pm_sig, pm_dev_src);
   ctx.tree_cache.pool                         = std::move(pool);
@@ -254,110 +369,48 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
   ctx.tree_cache.modality_tmp_qo_max_floats   = tables.modality_tmp_qo_max_floats;
   ctx.tree_cache.split_tmp_lin_max_floats     = tables.split_tmp_lin_max_floats;
   ctx.tree_cache.q01_outer_max_floats         = tables.q01_outer_max_floats;
-  ctx.tree_cache.factor_S_dev                 = std::move(factor_S_dev);
-  ctx.tree_cache.factor_depth_dev             = std::move(factor_depth_dev);
-  ctx.tree_cache.factor_qs_off_dev            = std::move(factor_qs_off_dev);
-  ctx.tree_cache.factor_I_off_dev             = std::move(factor_I_off_dev);
-  ctx.tree_cache.I_per_batch                  = I_per_batch;
+  ctx.tree_cache.factor_S_dev                 = std::move(meta.S_dev);
+  ctx.tree_cache.factor_depth_dev             = std::move(meta.depth_dev);
+  ctx.tree_cache.factor_qs_off_dev            = std::move(meta.qs_off_dev);
+  ctx.tree_cache.factor_I_off_dev             = std::move(meta.I_off_dev);
+  ctx.tree_cache.I_per_batch                  = meta.I_per_batch;
   return FfiError::Success();
 }
 
 // A cache: per-modality [Bn, O_m, K_m] + cuBLAS-permuted view for rank-3.
-// Rank-1/2 leave the cuBLAS slot empty. Returns A_tag for linear cache keying.
+// Returns A_tag for the downstream linear-cache key.
 FfiError fill_a_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* A_base, uint64_t* A_tag_out,
                       const void* A_dev_src = nullptr) {
-  const int      M            = static_cast<int>(L.M);
   const int64_t  A_total_size = static_cast<int64_t>(Bn) * L.A_off[L.M];
   const uint64_t A_tag        = content_tag(A_base, A_total_size);
   const uint64_t A_sig        = a_sig_bn(L, Bn);
   *A_tag_out                  = A_tag;
 
-  if (ctx.a_cache.match(A_tag, A_total_size, A_sig)) {
-    ctx.a_cache.key.last_devptr = A_dev_src;
-    return FfiError::Success();
-  }
-
-  // Plan pool: per-modality A (always) + cuBLAS view (rank-3 only), 8-byte aligned.
-  size_t total_bytes = 0;
-  for (int m = 0; m < M; ++m) {
-    const size_t per_batch = a_size(L, m);
-    total_bytes += round_up_8(static_cast<size_t>(Bn) * per_batch * sizeof(float));
-    const DependencyView deps = modality_state_deps(L, m);
-    if (deps.rank == 3) {
-      const int O_m     = static_cast<int>(L.O[m]);
-      const int S_split = dep_state_size(L, deps, 2);
-      const int S0      = dep_state_size(L, deps, 0);
-      const int S1      = dep_state_size(L, deps, 1);
-      const int K_keep  = S0 * S1;
-      total_bytes += round_up_8(static_cast<size_t>(Bn) * O_m * S_split * K_keep * sizeof(float));
-    }
-  }
+  if (ctx.a_cache.match_and_touch(A_tag, A_total_size, A_sig, A_dev_src)) return FfiError::Success();
 
   CuPool pool;
-  CUDA_TRY("a_pool_reserve", pool.reserve(total_bytes));
-
-  CuArrVec A_built;
-  CuArrVec A_cublas_built;
-  A_built.reserve(M);
-  A_cublas_built.reserve(M);
-  // Two pack scratches because rank-3 needs `packed` kept alive while we
-  // permute it into `cublas_packed`.
-  std::vector<float>& packed        = g_cuda_host_pack_scratch;
-  std::vector<float>& cublas_packed = g_cuda_host_pack_scratch_alt;
-  for (int m = 0; m < M; ++m) {
-    const size_t per_batch = a_size(L, m);
-    A_built.push_back(append_packed_slices(&pool, &packed, A_base, Bn, L.A_off[L.M], L.A_off[m], per_batch));
-
-    const int            O_m  = static_cast<int>(L.O[m]);
-    const DependencyView deps = modality_state_deps(L, m);
-    if (deps.rank == 3) {
-      const int S_split = dep_state_size(L, deps, 2);
-      const int S0      = dep_state_size(L, deps, 0);
-      const int S1      = dep_state_size(L, deps, 1);
-      const int K_keep  = S0 * S1;
-      // Permute (o, k_keep, s_split) to (o*S_split + s_split, k_keep) per b.
-      // packed already holds A_unflat in [Bn, O, K_keep, S_split] layout.
-      A_cublas_built.push_back(
-          append_rank3_cublas_view(&pool, packed, Bn, O_m, K_keep, S_split, per_batch, &cublas_packed));
-    } else {
-      A_cublas_built.emplace_back();
-    }
-  }
-  ctx.a_cache.store(A_tag, A_total_size, A_sig, std::move(pool), std::move(A_built), std::move(A_cublas_built),
-                    A_dev_src);
+  CUDA_TRY("a_pool_reserve", pool.reserve(a_pack_pool_bytes(L, Bn)));
+  CuArrVec arrays, cublas_views;
+  pack_a_modalities(L, Bn, A_base, &pool, &arrays, &cublas_views, &g_cuda_host_pack_scratch,
+                    &g_cuda_host_pack_scratch_alt);
+  ctx.a_cache.store(A_tag, A_total_size, A_sig, std::move(pool), std::move(arrays), std::move(cublas_views), A_dev_src);
   return FfiError::Success();
 }
 
 // B cache: per-factor [Bn, S_f, K_f, U_f]; K_f = product of B-dep state sizes.
 FfiError fill_b_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* B_base,
                       const void* B_dev_src = nullptr) {
-  const int      F            = static_cast<int>(L.F);
   const int64_t  B_total_size = static_cast<int64_t>(Bn) * L.B_off[L.F];
   const uint64_t B_tag        = content_tag(B_base, B_total_size);
   const uint64_t B_sig        = b_sig_bn(L, Bn);
 
-  if (ctx.b_cache.match(B_tag, B_total_size, B_sig)) {
-    ctx.b_cache.key.last_devptr = B_dev_src;
-    return FfiError::Success();
-  }
-
-  size_t total_bytes = 0;
-  for (int f = 0; f < F; ++f) {
-    const size_t per_batch = static_cast<size_t>(b_size(L, f));
-    total_bytes += round_up_8(static_cast<size_t>(Bn) * per_batch * sizeof(float));
-  }
+  if (ctx.b_cache.match_and_touch(B_tag, B_total_size, B_sig, B_dev_src)) return FfiError::Success();
 
   CuPool pool;
-  CUDA_TRY("b_pool_reserve", pool.reserve(total_bytes));
-
-  CuArrVec B_built;
-  B_built.reserve(F);
-  std::vector<float>& packed = g_cuda_host_pack_scratch;
-  for (int f = 0; f < F; ++f) {
-    const size_t per_batch = static_cast<size_t>(b_size(L, f));
-    B_built.push_back(append_packed_slices(&pool, &packed, B_base, Bn, L.B_off[L.F], L.B_off[f], per_batch));
-  }
-  ctx.b_cache.store(B_tag, B_total_size, B_sig, std::move(pool), std::move(B_built), B_dev_src);
+  CUDA_TRY("b_pool_reserve", pool.reserve(b_pack_pool_bytes(L, Bn)));
+  CuArrVec arrays;
+  pack_b_factors(L, Bn, B_base, &pool, &arrays, &g_cuda_host_pack_scratch);
+  ctx.b_cache.store(B_tag, B_total_size, B_sig, std::move(pool), std::move(arrays), B_dev_src);
   return FfiError::Success();
 }
 
@@ -367,56 +420,29 @@ FfiError fill_wa_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
     ctx.wa_cache.clear();
     return FfiError::Success();
   }
-  const int      M            = static_cast<int>(L.M);
   const int64_t  A_total_size = static_cast<int64_t>(Bn) * L.A_off[L.M];
   const uint64_t pA_tag       = content_tag(pA_base, A_total_size);
   const uint64_t pA_sig       = a_sig_bn(L, Bn);
-  if (ctx.wa_cache.match(pA_tag, A_total_size, pA_sig)) {
-    ctx.wa_cache.key.last_devptr = pA_dev_src;
-    return FfiError::Success();
-  }
-
-  size_t total_bytes = 0;
-  for (int m = 0; m < M; ++m) {
-    const size_t per_batch = a_size(L, m);
-    total_bytes += round_up_8(static_cast<size_t>(Bn) * per_batch * sizeof(float));
-    const DependencyView deps = modality_state_deps(L, m);
-    if (deps.rank == 3) {
-      total_bytes += round_up_8(static_cast<size_t>(Bn) * per_batch * sizeof(float));
-    }
-  }
+  if (ctx.wa_cache.match_and_touch(pA_tag, A_total_size, pA_sig, pA_dev_src)) return FfiError::Success();
 
   CuPool pool;
-  CUDA_TRY("wa_pool_reserve", pool.reserve(total_bytes));
-  CuArrVec wa_built;
-  CuArrVec wa_cublas_built;
-  wa_built.reserve(M);
-  wa_cublas_built.reserve(M);
-  std::vector<float>& packed = g_cuda_host_pack_scratch;
+  CUDA_TRY("wa_pool_reserve", pool.reserve(a_pack_pool_bytes(L, Bn)));
+
+  // Precompute wA per batch into a contiguous [Bn, A_total] buffer, then
+  // hand it to pack_a_modalities just like raw A. `_alt` holds the cross-
+  // batch precompute, so the rank-3 cuBLAS permute uses a local scratch
+  // (only touched when at least one modality is rank-3).
   std::vector<float>& all_wA = g_cuda_host_pack_scratch_alt;
-  std::vector<float>  cublas_packed;
   all_wA.assign(static_cast<size_t>(Bn) * L.A_off[L.M], 0.0f);
   for (int b = 0; b < Bn; ++b) {
-    std::vector<float> wA_b = precompute_wA(L, pA_base + static_cast<int64_t>(b) * L.A_off[L.M]);
+    const std::vector<float> wA_b = precompute_wA(L, pA_base + static_cast<int64_t>(b) * L.A_off[L.M]);
     std::memcpy(all_wA.data() + static_cast<size_t>(b) * L.A_off[L.M], wA_b.data(), wA_b.size() * sizeof(float));
   }
-  for (int m = 0; m < M; ++m) {
-    const size_t per_batch = a_size(L, m);
-    wa_built.push_back(append_packed_slices(&pool, &packed, all_wA.data(), Bn, L.A_off[L.M], L.A_off[m], per_batch));
-    const DependencyView deps = modality_state_deps(L, m);
-    if (deps.rank == 3) {
-      const int O_m     = static_cast<int>(L.O[m]);
-      const int S_split = dep_state_size(L, deps, 2);
-      const int S0      = dep_state_size(L, deps, 0);
-      const int S1      = dep_state_size(L, deps, 1);
-      const int K_keep  = S0 * S1;
-      wa_cublas_built.push_back(
-          append_rank3_cublas_view(&pool, packed, Bn, O_m, K_keep, S_split, per_batch, &cublas_packed));
-    } else {
-      wa_cublas_built.emplace_back();
-    }
-  }
-  ctx.wa_cache.store(pA_tag, A_total_size, pA_sig, std::move(pool), std::move(wa_built), std::move(wa_cublas_built),
+
+  CuArrVec           arrays, cublas_views;
+  std::vector<float> cublas_scratch;
+  pack_a_modalities(L, Bn, all_wA.data(), &pool, &arrays, &cublas_views, &g_cuda_host_pack_scratch, &cublas_scratch);
+  ctx.wa_cache.store(pA_tag, A_total_size, pA_sig, std::move(pool), std::move(arrays), std::move(cublas_views),
                      pA_dev_src);
   return FfiError::Success();
 }
@@ -427,59 +453,85 @@ FfiError fill_wb_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
     ctx.wb_cache.clear();
     return FfiError::Success();
   }
-  const int      F            = static_cast<int>(L.F);
   const int64_t  B_total_size = static_cast<int64_t>(Bn) * L.B_off[L.F];
   const uint64_t pB_tag       = content_tag(pB_base, B_total_size);
   const uint64_t pB_sig       = b_sig_bn(L, Bn);
-  if (ctx.wb_cache.match(pB_tag, B_total_size, pB_sig)) {
-    ctx.wb_cache.key.last_devptr = pB_dev_src;
-    return FfiError::Success();
-  }
-
-  size_t total_bytes = 0;
-  for (int f = 0; f < F; ++f) {
-    const size_t per_batch = static_cast<size_t>(b_size(L, f));
-    total_bytes += round_up_8(static_cast<size_t>(Bn) * per_batch * sizeof(float));
-  }
+  if (ctx.wb_cache.match_and_touch(pB_tag, B_total_size, pB_sig, pB_dev_src)) return FfiError::Success();
 
   CuPool pool;
-  CUDA_TRY("wb_pool_reserve", pool.reserve(total_bytes));
-  CuArrVec wb_built;
-  wb_built.reserve(F);
-  std::vector<float>& packed = g_cuda_host_pack_scratch;
+  CUDA_TRY("wb_pool_reserve", pool.reserve(b_pack_pool_bytes(L, Bn)));
+
+  // Precompute wB (transposed layout) per batch, then hand the [Bn, B_total]
+  // buffer to pack_b_factors.
   std::vector<float>& all_wB = g_cuda_host_pack_scratch_alt;
   all_wB.assign(static_cast<size_t>(Bn) * L.B_off[L.F], 0.0f);
   for (int b = 0; b < Bn; ++b) {
-    TransposedB wB_b = precompute_wB_transposed(L, pB_base + static_cast<int64_t>(b) * L.B_off[L.F]);
+    const TransposedB wB_b = precompute_wB_transposed(L, pB_base + static_cast<int64_t>(b) * L.B_off[L.F]);
     std::memcpy(all_wB.data() + static_cast<size_t>(b) * L.B_off[L.F], wB_b.data.data(),
                 wB_b.data.size() * sizeof(float));
   }
-  for (int f = 0; f < F; ++f) {
-    const size_t per_batch = static_cast<size_t>(b_size(L, f));
-    wb_built.push_back(append_packed_slices(&pool, &packed, all_wB.data(), Bn, L.B_off[L.F], L.B_off[f], per_batch));
-  }
-  ctx.wb_cache.store(pB_tag, B_total_size, pB_sig, std::move(pool), std::move(wb_built), pB_dev_src);
+
+  CuArrVec arrays;
+  pack_b_factors(L, Bn, all_wB.data(), &pool, &arrays, &g_cuda_host_pack_scratch);
+  ctx.wb_cache.store(pB_tag, B_total_size, pB_sig, std::move(pool), std::move(arrays), pB_dev_src);
   return FfiError::Success();
 }
 
-// Linear cache: per-(t, m, b, k) tensor fusing the HA entropy contribution
-// and the A^T C utility contribution. C is read directly (only CUDA consumer).
+// Bytes needed in a CuPool for the per-(t, m) linear cache.
+inline size_t linear_pool_bytes(const Layout& L, int Bn) {
+  const int T     = static_cast<int>(L.T);
+  size_t    total = 0;
+  for (int m = 0; m < static_cast<int>(L.M); ++m) {
+    const int O   = static_cast<int>(L.O[m]);
+    const int K_m = static_cast<int>(a_size(L, m) / O);
+    total += static_cast<size_t>(T) * round_up_8(static_cast<size_t>(Bn) * K_m * sizeof(float));
+  }
+  return total;
+}
+
+// Build the per-(t, m) `linear` slice into `tmp` (size [Bn, K_m]):
+//   linear[b, k] = (use_utility ? sum_o A[b, o, k] * C[b, t, m, o] : 0)
+//                - (use_states_info_gain ? HA[b, m, k] : 0)
+// HA = -sum_o xlogx(A); linear wants -HA, hence the subtract.
+void build_linear_tm_slice(const Layout& L, int Bn, int t, int m, KernelFlags flags, const float* A_base,
+                           const float* C_base, const std::vector<PrecomputedHA>& HA_per_batch,
+                           std::vector<float>* tmp) {
+  const int O   = static_cast<int>(L.O[m]);
+  const int K_m = static_cast<int>(a_size(L, m) / O);
+  tmp->assign(static_cast<size_t>(Bn) * K_m, 0.0f);
+  for (int b = 0; b < Bn; ++b) {
+    float*       dst  = tmp->data() + static_cast<size_t>(b) * K_m;
+    const float* A_bm = A_base + b * L.A_off[L.M] + L.A_off[m];  // [O, K_m]
+    if (flags.use_states_info_gain) {
+      const PrecomputedHA& ha  = HA_per_batch[b];
+      const float*         HAm = ha.data.data() + ha.offsets[m];
+      for (int k = 0; k < K_m; ++k) dst[k] -= HAm[k];
+    }
+    if (flags.use_utility) {
+      // C is [Bn, sum_m T*O_m]; the per-(t, m, b) slice is [O_m].
+      const float* C_btm = C_base + b * L.C_off[L.M] + L.C_off[m] + t * O;
+      for (int o = 0; o < O; ++o) {
+        const float  c_o  = C_btm[o];
+        const float* A_bo = A_bm + static_cast<size_t>(o) * K_m;
+        for (int k = 0; k < K_m; ++k) dst[k] += A_bo[k] * c_o;
+      }
+    }
+  }
+}
+
+// Linear cache: per-(t, m) [Bn, K_m] tensor fusing the HA entropy term and
+// the A^T C utility term. Key uses only the two flags that shape `linear`.
 FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const float* A_base,
                            const float* C_base, uint64_t A_tag, const void* A_dev_src = nullptr,
                            const void* C_dev_src = nullptr) {
-  const int      T            = static_cast<int>(L.T);
-  const int      M            = static_cast<int>(L.M);
-  const int64_t  C_total_size = static_cast<int64_t>(Bn) * L.C_off[L.M];
-  const uint64_t C_tag        = flags.use_utility ? content_tag(C_base, C_total_size) : 0;
-  const uint64_t linear_sig   = cuda_linear_sig(L, Bn);
-  // Only the two flags that actually shape `linear` matter for the cache
-  // key; use_inductive and use_param_info_gain don't change the value.
-  const int32_t flag_bits = (flags.use_states_info_gain ? 1 : 0) | (flags.use_utility ? 2 : 0);
-  // c_dev is meaningful only when use_utility is on.
-  const void* c_dev_for_key = flags.use_utility ? C_dev_src : nullptr;
-  if (ctx.linear_cache.match(A_tag, C_tag, linear_sig, flag_bits)) {
-    ctx.linear_cache.last_a_devptr = A_dev_src;
-    ctx.linear_cache.last_c_devptr = c_dev_for_key;
+  const int      T             = static_cast<int>(L.T);
+  const int      M             = static_cast<int>(L.M);
+  const int64_t  C_total_size  = static_cast<int64_t>(Bn) * L.C_off[L.M];
+  const uint64_t C_tag         = flags.use_utility ? content_tag(C_base, C_total_size) : 0;
+  const uint64_t linear_sig    = cuda_linear_sig(L, Bn);
+  const int32_t  flag_bits     = (flags.use_states_info_gain ? 1 : 0) | (flags.use_utility ? 2 : 0);
+  const void*    c_dev_for_key = flags.use_utility ? C_dev_src : nullptr;
+  if (ctx.linear_cache.match_and_touch(A_tag, C_tag, linear_sig, flag_bits, A_dev_src, c_dev_for_key)) {
     return FfiError::Success();
   }
   if (flag_bits == 0) {
@@ -487,55 +539,25 @@ FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flag
     return FfiError::Success();
   }
 
-  // precompute_HA returns HA = -sum_o xlogx(A); linear term wants -HA (subtract).
   std::vector<PrecomputedHA> HA_per_batch;
   if (flags.use_states_info_gain) {
     HA_per_batch.reserve(Bn);
-    for (int b = 0; b < Bn; ++b) {
-      HA_per_batch.push_back(precompute_HA(L, A_base + b * L.A_off[L.M]));
-    }
-  }
-
-  // Per-(t, m) [Bn, K_m] f32; K_m depends only on m, 8-byte aligned.
-  size_t total_bytes = 0;
-  for (int m = 0; m < M; ++m) {
-    const int O   = static_cast<int>(L.O[m]);
-    const int K_m = static_cast<int>((L.A_off[m + 1] - L.A_off[m]) / O);
-    total_bytes += static_cast<size_t>(T) * round_up_8(static_cast<size_t>(Bn) * K_m * sizeof(float));
+    for (int b = 0; b < Bn; ++b) HA_per_batch.push_back(precompute_HA(L, A_base + b * L.A_off[L.M]));
   }
 
   CuPool pool;
-  CUDA_TRY("linear_pool_reserve", pool.reserve(total_bytes));
+  CUDA_TRY("linear_pool_reserve", pool.reserve(linear_pool_bytes(L, Bn)));
 
   CuArrGrid2D         per_tm(T);
   std::vector<float>& tmp = g_cuda_host_pack_scratch;
   for (int t = 0; t < T; ++t) {
     per_tm[t].resize(M);
     for (int m = 0; m < M; ++m) {
-      const int O   = static_cast<int>(L.O[m]);
-      const int K_m = static_cast<int>(a_size(L, m) / O);
-      tmp.assign(static_cast<size_t>(Bn) * K_m, 0.0f);
-      for (int b = 0; b < Bn; ++b) {
-        float*       dst  = tmp.data() + static_cast<size_t>(b) * K_m;
-        const float* A_bm = A_base + b * L.A_off[L.M] + L.A_off[m];  // [O, K_m]
-        if (flags.use_states_info_gain) {
-          const PrecomputedHA& ha  = HA_per_batch[b];
-          const float*         HAm = ha.data.data() + ha.offsets[m];
-          for (int k = 0; k < K_m; ++k) dst[k] -= HAm[k];
-        }
-        if (flags.use_utility) {
-          // C layout: [Bn, sum_m T*O_m]; per-(t, m, b) slice = [O_m].
-          const float* C_btm = C_base + b * L.C_off[L.M] + L.C_off[m] + t * O;
-          for (int o = 0; o < O; ++o) {
-            const float  c_o  = C_btm[o];
-            const float* A_bo = A_bm + static_cast<size_t>(o) * K_m;
-            for (int k = 0; k < K_m; ++k) dst[k] += A_bo[k] * c_o;
-          }
-        }
-      }
+      build_linear_tm_slice(L, Bn, t, m, flags, A_base, C_base, HA_per_batch, &tmp);
       per_tm[t][m] = pool.append_copy(tmp.data(), tmp.size() * sizeof(float));
     }
   }
+
   ctx.linear_cache.a_tag         = A_tag;
   ctx.linear_cache.c_tag         = C_tag;
   ctx.linear_cache.layout_sig    = linear_sig;
@@ -551,8 +573,6 @@ FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flag
 FfiError prepare_caches(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const int32_t* pm_base,
                         const float* A_base, const float* B_base, const float* C_base, const float* pA_base,
                         const float* pB_base, bool pA_present, bool pB_present, DevSrcs srcs = {}) {
-  // Broadcast precondition is enforced inside fill_tree_cache (cache-miss
-  // path only); on cache hit we trust the pm_tag covering [Bn, P, T, F].
   PYMDP_TRY(fill_tree_cache(ctx, L, Bn, pm_base, srcs.pm));
   uint64_t A_tag = 0;
   PYMDP_TRY(fill_a_cache(ctx, L, Bn, A_base, &A_tag, srcs.A));
@@ -568,9 +588,9 @@ FfiError prepare_caches(NegEfeContext& ctx, const Layout& L, KernelFlags flags, 
   return FfiError::Success();
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // Forward pass
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 struct ForwardDims {
   int P;
@@ -585,7 +605,8 @@ ForwardDims forward_dims(const Layout& L) {
           static_cast<int>(L.qs_flat)};
 }
 
-FfiError ensure_forward_scratch(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, cudaStream_t stream) {
+FfiError ensure_forward_scratch(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, cudaStream_t stream,
+                                bool out_is_external) {
   const ForwardDims          d                 = forward_dims(L);
   const FactorHistoryLevels& ftree             = ctx.tree_cache.factor_tree;
   const int64_t              total_mod_entries = ctx.tree_cache.total_mod_entries;
@@ -607,13 +628,18 @@ FfiError ensure_forward_scratch(NegEfeContext& ctx, const Layout& L, KernelFlags
   }
   CUDA_TRY("scratch scores_concat",
            ctx.scratch.scores_concat.ensure(static_cast<size_t>(Bn) * total_mod_entries * sizeof(float)));
-  CUDA_TRY("scratch out_dev", ctx.scratch.out_dev.ensure(static_cast<size_t>(Bn) * d.P * sizeof(float)));
+  // out_is_external: the dev path scatters directly into JAX's output buffer
+  // (threaded through StageCtx.out_dev_ptr), so we must not allocate or
+  // ensure() the owned scratch slot.
+  if (!out_is_external) {
+    CUDA_TRY("scratch out_dev", ctx.scratch.out_dev.ensure(static_cast<size_t>(Bn) * d.P * sizeof(float)));
+  }
   if (flags.use_inductive) {
     CUDA_TRY("scratch v_full", ctx.scratch.v_full_dev.ensure(static_cast<size_t>(Bn) * d.qsf * sizeof(float)));
     CUDA_TRY("scratch inductive_concat",
              ctx.scratch.inductive_concat.ensure(static_cast<size_t>(Bn) * total_ind_entries * sizeof(float)));
   }
-  if (flags.use_param_info_gain) {
+  if (needs_factor_scores(ctx, flags)) {
     CUDA_TRY("scratch factor_scores",
              ctx.scratch.factor_scores.ensure(static_cast<size_t>(Bn) * total_ind_entries * sizeof(float)));
   }
@@ -628,14 +654,20 @@ FfiError ensure_forward_scratch(NegEfeContext& ctx, const Layout& L, KernelFlags
     }
     CUDA_TRY("scratch split_tmp_lin",
              ctx.scratch.split_tmp_lin.ensure(ctx.tree_cache.split_tmp_lin_max_floats * sizeof(float)));
-    // Sized for the largest rank-2/3 modality (max computed at cache fill).
+    // Both q01_outer and tmp_qo_cublas are sized for the worst-case rank-2/3
+    // modality (cache-fill pass takes the max across modalities).
     CUDA_TRY("scratch q01_outer", ctx.scratch.q01_outer.ensure(ctx.tree_cache.q01_outer_max_floats * sizeof(float)));
-    // tmp_qo_cublas covers rank-3 ([Bn, O*S_split, H_kk]) and rank-2 ([Bn, O, H_kk]);
-    // the cache sizing takes the max across all modalities.
     CUDA_TRY("scratch tmp_qo_cublas",
              ctx.scratch.tmp_qo_cublas.ensure(ctx.tree_cache.modality_tmp_qo_max_floats * sizeof(float)));
     PYMDP_TRY(ensure_cublas_handle(ctx));
-    CUBLAS_TRY("cublasSetStream", cublasSetStream(ctx.cublas_handle.handle, stream));
+    // Skip the cublasSetStream syscall when JAX hands us the same stream as
+    // last call — the JIT typically keeps the stream stable across invocations
+    // of the same compiled executable, so this short-circuits to a pointer
+    // compare on the steady-state path.
+    if (ctx.cublas_handle.bound_stream != stream) {
+      CUBLAS_TRY("cublasSetStream", cublasSetStream(ctx.cublas_handle.handle, stream));
+      ctx.cublas_handle.bound_stream = stream;
+    }
   }
   return FfiError::Success();
 }
@@ -650,12 +682,9 @@ void upload_qs_init(NegEfeContext& ctx, const Layout& L, int Bn, const float* qs
   }
 }
 
-// D2D variant for the platform="CUDA" path. qs_dev points into JAX's
-// qs_init device buffer (laid out [Bn, qs_flat] where qs_flat = sum_f S_f).
-// One cudaMemcpy2DAsync per factor: src is strided by qs_flat per batch,
-// dst is contiguous per-factor [Bn, S_f]. Async on the XLA stream — caller
-// does NOT sync; the kernel reads qs_init_per_factor[f] later on the same
-// stream so ordering is preserved by the stream itself.
+// D2D variant of upload_qs_init for the dev path: one cudaMemcpy2DAsync per
+// factor, gathering [Bn, qs_flat] strided into contiguous per-factor [Bn, S_f].
+// Stays on the XLA stream — kernel reads downstream preserve ordering.
 FfiError upload_qs_init_d2d(NegEfeContext& ctx, const Layout& L, int Bn, const float* qs_dev, cudaStream_t stream) {
   const ForwardDims d = forward_dims(L);
   for (int f = 0; f < d.F; ++f) {
@@ -672,11 +701,9 @@ FfiError upload_qs_init_d2d(NegEfeContext& ctx, const Layout& L, int Bn, const f
   return FfiError::Success();
 }
 
-// Device-side equivalent of upload_inductive_vector: launches the v_full
-// kernel directly against JAX qs_init / I / eps device pointers — no D2H,
-// no host argmax + sum, no trailing sync. The caller must have already
-// run prepare_caches so the tree cache holds the per-factor metadata
-// arrays the kernel reads.
+// D2D variant of upload_inductive_vector: launches the v_full kernel
+// directly against JAX's qs_init / I / eps device pointers (no D2H, no
+// host argmax). Requires the tree cache to be filled (per-factor metadata).
 FfiError upload_inductive_vector_d2d(NegEfeContext& ctx, const Layout& L, int Bn, const float* qs_dev,
                                      const float* I_dev, const float* eps_dev, EpsilonLayout epsilon,
                                      cudaStream_t stream) {
@@ -745,13 +772,23 @@ FfiError launch_b_rollout_level(const StageCtx& stage, int t, const QsLevel& cur
     const int32_t*       action_h = factor_action_per_history[t][f].as<const int32_t>();
     const int32_t*       parent_h = factor_parent_history[t][f].as<const int32_t>();
     float*               qs_out   = ctx.scratch.qs_factor_buf[write_slot][f].as<float>();
+    const bool           do_fs    = needs_factor_scores(ctx, stage.flags);
     float*               factor_score =
-        stage.flags.use_param_info_gain
+        do_fs
             ? (ctx.scratch.factor_scores.as<float>() + ctx.tree_cache.ind_score_offsets[static_cast<size_t>(t) * F + f])
             : nullptr;
-    const float* wB_f = (stage.flags.use_param_info_gain && !ctx.wb_cache.arrays.empty())
-                            ? ctx.wb_cache.arrays[f].as<const float>()
-                            : nullptr;
+    const float* wB_f = do_fs ? ctx.wb_cache.arrays[f].as<const float>() : nullptr;
+
+    // Inductive is folded into the B-rollout phase-2 reduction when
+    // use_inductive is on; nullptr disables the inner reduction in the kernel.
+    const float*  v_full        = stage.flags.use_inductive ? ctx.scratch.v_full_dev.as<const float>() : nullptr;
+    float*        ind_score_t_f = stage.flags.use_inductive
+                                      ? (ctx.scratch.inductive_concat.as<float>() +
+                                         ctx.tree_cache.ind_score_offsets[static_cast<size_t>(t) * F + f])
+                                      : nullptr;
+    const int     qs_flat       = static_cast<int>(L.qs_flat);
+    const int     qs_off_f      = static_cast<int>(L.qs_off[f]);
+    const int64_t ind_b_stride  = ctx.tree_cache.total_ind_entries;
 
     cuda_kernels::BRolloutParents parents{};
     for (int i = 0; i < n_par; ++i) {
@@ -761,17 +798,19 @@ FfiError launch_b_rollout_level(const StageCtx& stage, int t, const QsLevel& cur
       parents.S[i]     = static_cast<int>(L.S[pf]);
     }
     CUDA_TRY("b_rollout_general",
-             cuda_kernels::launch_b_rollout_general(B_f, wB_f, action_h, parent_h, parents, n_par, stage.Bn, Hf_t, Sf,
-                                                    K_f, Uf, qs_out, factor_score, stage.stream));
+             cuda_kernels::launch_b_rollout_general(B_f, wB_f, v_full, qs_flat, qs_off_f, action_h, parent_h, parents,
+                                                    n_par, stage.Bn, Hf_t, Sf, K_f, Uf, qs_out, factor_score,
+                                                    ind_score_t_f, ind_b_stride, stage.stream));
     next->ptrs[f]      = qs_out;
     next->histories[f] = Hf_t;
   }
   return FfiError::Success();
 }
 
-// `__restrict__` on every pointer: each field aliases a distinct cache slot
-// (a-cache / wa-cache / linear-cache / scratch.scores_concat) — the no-alias
-// guarantee propagates through the launch helpers' inner sgemv / score loops.
+// All pointers carry __restrict__ — each field aliases a distinct cache /
+// scratch slot, so the no-alias guarantee can propagate into inner loops.
+// H[i] for i in [deps.rank, kRankMax) is 1-padded by build_modality_score
+// _layout; rank-{1,2} kernels ignore the trailing entries.
 struct ModalityLaunch {
   DependencyView deps;
   const float* __restrict__ A_unflat;
@@ -779,10 +818,7 @@ struct ModalityLaunch {
   const float* __restrict__ wA_cublas;
   const float* __restrict__ linear;
   float* __restrict__ score_out;
-  int O;
-  // Per-dep history counts. Entries [0, deps.rank) carry H_d_i; trailing
-  // entries are 1-padded to match build_modality_score_layout's mod_h_dims
-  // encoding (rank-{1,2} modalities ignore the padding).
+  int                                     O;
   std::array<int, cuda_kernels::kRankMax> H;
   bool                                    use_states;
   bool                                    use_linear;
@@ -799,9 +835,14 @@ ModalityLaunch make_modality_launch(const StageCtx& stage, int t, int m) {
   ModalityLaunch     ml{};
   ml.deps     = modality_state_deps(L, m);
   ml.A_unflat = ctx.a_cache.arrays[m].as<const float>();
-  ml.wA_unflat =
-      (flags.use_param_info_gain && !ctx.wa_cache.arrays.empty()) ? ctx.wa_cache.arrays[m].as<const float>() : nullptr;
-  ml.wA_cublas  = (flags.use_param_info_gain && !ctx.wa_cache.cublas_views.empty())
+  // wA cache may be shorter than M (e.g. only the modalities that actually
+  // have pA filled) — `!empty()` is not sufficient. Index by m only after
+  // bounds-checking, otherwise this is a host-side OOB read that can SEGV.
+  ml.wA_unflat  = (flags.use_param_info_gain && static_cast<size_t>(m) < ctx.wa_cache.arrays.size())
+                      ? ctx.wa_cache.arrays[m].as<const float>()
+                      : nullptr;
+  ml.wA_cublas  = (flags.use_param_info_gain && static_cast<size_t>(m) < ctx.wa_cache.cublas_views.size() &&
+                   ctx.wa_cache.cublas_views[m].ptr != nullptr)
                       ? ctx.wa_cache.cublas_views[m].as<const float>()
                       : nullptr;
   ml.score_out  = ctx.scratch.scores_concat.as<float>() + mod_off[tm_index(t, m, M)];
@@ -831,20 +872,16 @@ constexpr int     kTinyFusedModalityMaxK    = 64;
 constexpr int     kTinyFusedModalityMaxO    = 16;
 
 inline bool use_tiny_fused_modality_path(const ModalityLaunch& ml, int Bn, int H_total, int K) {
-  // Number of full K-loop passes the fused kernel will do per output history.
-  // A pass is required for qo if states or pA is used. pA adds a wA pass.
-  // linear adds one more pass.
+  // K-loop passes per output history: qo (states or pA) + wA (pA) + linear.
+  // When all terms are off the fused kernel still wins (one cheap zero-write,
+  // no q01_outer materialization).
   int passes = 0;
   if (ml.use_states || ml.use_pA) passes += ml.O;
   if (ml.use_pA) passes += ml.O;
   if (ml.use_linear) passes += 1;
-
-  // Even if all terms are disabled, the fused path is fine: it writes zeros
-  // with one cheap kernel and avoids constructing q01_outer.
   if (passes == 0) return true;
 
   const int64_t work = static_cast<int64_t>(Bn) * H_total * K * passes;
-
   return K <= kTinyFusedModalityMaxK && ml.O <= kTinyFusedModalityMaxO && work <= kTinyFusedModalityMaxWork;
 }
 
@@ -952,8 +989,15 @@ FfiError launch_modality_rank3(const StageCtx& stage, const QsLevel& qs_next, co
   }
 
   if (ml.use_linear) {
-    CUDA_TRY("tmp_lin_per_h", cuda_kernels::launch_tmp_lin_per_h(q01_outer, ml.linear, stage.Bn, K_keep, H_kk, S_split,
-                                                                 tmp_lin_buf, stage.stream));
+    // cuBLAS sgemm beats the per-(b,h,s) thread-K kernel above ~H_kk=32 on
+    // sm_53 (microbench_modality_subkernels); dispatch overhead loses below.
+    constexpr int kTmpLinCublasMinHkk = 32;
+    if (H_kk >= kTmpLinCublasMinHkk) {
+      PYMDP_TRY(run_batched_tmp_lin_gemm(stage, q01_outer, ml.linear, tmp_lin_buf, K_keep, H_kk, S_split));
+    } else {
+      CUDA_TRY("tmp_lin_per_h", cuda_kernels::launch_tmp_lin_per_h(q01_outer, ml.linear, stage.Bn, K_keep, H_kk,
+                                                                   S_split, tmp_lin_buf, stage.stream));
+    }
   }
 
   CUDA_TRY("modality_score_dedup_rank3_stage2",
@@ -986,62 +1030,44 @@ FfiError launch_modality_scores(const StageCtx& stage, int t, const QsLevel& qs_
   return FfiError::Success();
 }
 
-FfiError launch_inductive_scores(const StageCtx& stage, int t, const QsLevel& qs_next) {
-  NegEfeContext&     ctx               = stage.ctx;
-  const Layout&      L                 = stage.L;
-  const ForwardDims  d                 = forward_dims(L);
-  const FfiInt64Vec& ind_off           = ctx.tree_cache.ind_score_offsets;
-  const int64_t      total_ind_entries = ctx.tree_cache.total_ind_entries;
-  for (int f = 0; f < d.F; ++f) {
-    const int Sf      = static_cast<int>(L.S[f]);
-    const int Hf_t    = qs_next.histories[f];
-    float*    ind_out = ctx.scratch.inductive_concat.as<float>() + ind_off[static_cast<size_t>(t) * d.F + f];
-    CUDA_TRY("inductive_per_factor",
-             cuda_kernels::launch_inductive_per_factor(qs_next.ptrs[f], ctx.scratch.v_full_dev.as<const float>(),
-                                                       stage.Bn, Hf_t, Sf, d.qsf, static_cast<int>(L.qs_off[f]),
-                                                       total_ind_entries, ind_out, stage.stream));
-  }
-  return FfiError::Success();
-}
-
 FfiError launch_final_scatter(const StageCtx& stage) {
   NegEfeContext&     ctx   = stage.ctx;
   const KernelFlags& flags = stage.flags;
   const ForwardDims  d     = forward_dims(stage.L);
+  const bool         do_fs = needs_factor_scores(ctx, flags);
   CUDA_TRY("final_scatter_dedup",
            cuda_kernels::launch_final_scatter_dedup(
                ctx.scratch.scores_concat.as<const float>(),
                flags.use_inductive ? ctx.scratch.inductive_concat.as<const float>() : nullptr,
-               flags.use_param_info_gain ? ctx.scratch.factor_scores.as<const float>() : nullptr,
+               do_fs ? ctx.scratch.factor_scores.as<const float>() : nullptr,
                ctx.tree_cache.policy_to_modality_idx_dev.as<const int32_t>(),
                ctx.tree_cache.factor_policy_to_history_dev.as<const int32_t>(),
                ctx.tree_cache.mod_score_offsets_dev.as<const int64_t>(),
-               (flags.use_inductive || flags.use_param_info_gain)
-                   ? ctx.tree_cache.ind_score_offsets_dev.as<const int64_t>()
-                   : nullptr,
+               (flags.use_inductive || do_fs) ? ctx.tree_cache.ind_score_offsets_dev.as<const int64_t>() : nullptr,
                stage.Bn, d.T, d.M, d.F, d.P, ctx.tree_cache.total_mod_entries, ctx.tree_cache.total_ind_entries,
-               flags.use_inductive, flags.use_param_info_gain, ctx.scratch.out_dev.as<float>(), stage.stream));
+               flags.use_inductive, do_fs, stage.out_dev_ptr, stage.stream));
   return FfiError::Success();
 }
 
 // Drives the forward pass. Caller must have called ensure_forward_scratch,
 // upload_qs_init[_d2d], and (when use_inductive) upload_inductive_vector[_d2d].
-// out_host_or_null: non-null (NegEfeCudaHost) → D2H + sync after scatter;
-// nullptr (NegEfeCudaDev) → ctx.scratch.out_dev already points at JAX's
-// device output buffer, so the scatter writes there and D2H is skipped.
-FfiError run_forward(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, float* out_host_or_null,
-                     cudaStream_t stream = nullptr) {
-  const StageCtx    stage{ctx, L, flags, Bn, stream};
+// scatter_out_dev: device-side scatter destination (host path: ctx.scratch
+// .out_dev managed buffer; dev path: JAX's output device buffer).
+// out_host_or_null: non-null (NegEfeCudaHost) → D2H from scatter_out_dev
+// into the host out buffer + sync after scatter; nullptr (NegEfeCudaDev)
+// → scatter wrote straight to JAX's output, no D2H needed.
+FfiError run_forward(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, float* scatter_out_dev,
+                     float* out_host_or_null, cudaStream_t stream = nullptr) {
+  const StageCtx    stage{ctx, L, flags, Bn, stream, scatter_out_dev};
   const ForwardDims d = forward_dims(L);
 
+  // launch_b_rollout_level folds the per-(t, f) inductive score into phase 2
+  // when use_inductive is on, so there is no separate inductive launch step.
   QsLevel curr = initial_qs_level(stage);
-  QsLevel next;
   for (int t = 0; t < d.T; ++t) {
+    QsLevel next;
     PYMDP_TRY(launch_b_rollout_level(stage, t, curr, &next));
     PYMDP_TRY(launch_modality_scores(stage, t, next));
-    if (flags.use_inductive) {
-      PYMDP_TRY(launch_inductive_scores(stage, t, next));
-    }
     curr = std::move(next);
   }
 
@@ -1049,10 +1075,69 @@ FfiError run_forward(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int
   if (out_host_or_null != nullptr) {
     // D2H into host out buffer + sync (Tegra: managed memory aliases host DRAM).
     CUDA_TRY("memcpy_async_out",
-             cudaMemcpyAsync(out_host_or_null, ctx.scratch.out_dev.ptr, static_cast<size_t>(Bn) * d.P * sizeof(float),
+             cudaMemcpyAsync(out_host_or_null, scatter_out_dev, static_cast<size_t>(Bn) * d.P * sizeof(float),
                              cudaMemcpyDefault, stream));
     CUDA_TRY("stream_sync", cudaStreamSynchronize(stream));
   }
+  return FfiError::Success();
+}
+
+// -----------------------------------------------------------------------------
+// Entry-point glue: warm-cache check, async D2H. The parse + validate prologue
+// (ParsedCall / parse_and_validate_call) is shared via neg_efe_entry.h.
+// -----------------------------------------------------------------------------
+
+// True when all six caches still match the current devptrs / sigs.
+bool caches_are_warm(const NegEfeContext& ctx, const Layout& L, int Bn, KernelFlags flags, bool pA_present,
+                     bool pB_present, const DevSrcs& devs) {
+  const uint64_t pm_sig       = factor_history_pm_sig(L);
+  const int64_t  pm_size      = static_cast<int64_t>(Bn) * L.P * L.T * L.F;
+  const uint64_t a_sig        = a_sig_bn(L, Bn);
+  const int64_t  a_size       = static_cast<int64_t>(Bn) * L.A_off[L.M];
+  const uint64_t b_sig        = b_sig_bn(L, Bn);
+  const int64_t  b_size       = static_cast<int64_t>(Bn) * L.B_off[L.F];
+  const uint64_t linear_sig   = cuda_linear_sig(L, Bn);
+  const int32_t  linear_flags = (flags.use_states_info_gain ? 1 : 0) | (flags.use_utility ? 2 : 0);
+
+  if (!ctx.tree_cache.match_devptr(devs.pm, pm_size, pm_sig)) return false;
+  if (!ctx.a_cache.match_devptr(devs.A, a_size, a_sig)) return false;
+  if (!ctx.b_cache.match_devptr(devs.B, b_size, b_sig)) return false;
+  if (!ctx.linear_cache.match_devptr(devs.A, devs.C, linear_sig, linear_flags)) return false;
+  if (flags.use_param_info_gain && pA_present && !ctx.wa_cache.match_devptr(devs.pA, a_size, a_sig)) return false;
+  if (flags.use_param_info_gain && pB_present && !ctx.wb_cache.match_devptr(devs.pB, b_size, b_sig)) return false;
+  return true;
+}
+
+// Async D2H from a device buffer into a host vector. Caller syncs the stream
+// before reading the host bytes.
+template <typename T> FfiError d2h_into(std::vector<T>* dst, const T* src_dev, std::size_t n, cudaStream_t stream) {
+  dst->resize(n);
+  if (n == 0) return FfiError::Success();
+  cudaError_t rc = cudaMemcpyAsync(dst->data(), src_dev, n * sizeof(T), cudaMemcpyDeviceToHost, stream);
+  if (rc != cudaSuccess) {
+    return invalid_arg(kEfeKernelName, std::string("cudaMemcpyAsync D2H failed: ") + cudaGetErrorString(rc));
+  }
+  return FfiError::Success();
+}
+
+// Tegra zero-copy variant of d2h_into. If `src_dev` is host-accessible
+// (managed or pinned), returns the host alias and skips the D2H entirely.
+// Otherwise queues the cudaMemcpyAsync into `dst` and returns dst->data().
+// Caller still must sync the stream before reading the result, regardless of
+// path: even for managed/pinned memory, prior queued ops may still be writing
+// to it.
+template <typename T>
+FfiError d2h_or_alias(std::vector<T>* dst, const T* src_dev, std::size_t n, cudaStream_t stream, const T** out_host) {
+  if (n == 0) {
+    *out_host = nullptr;
+    return FfiError::Success();
+  }
+  if (void* alias = try_alias_as_host(src_dev)) {
+    *out_host = static_cast<const T*>(alias);
+    return FfiError::Success();
+  }
+  PYMDP_TRY(d2h_into(dst, src_dev, n, stream));
+  *out_host = dst->data();
   return FfiError::Success();
 }
 
@@ -1079,10 +1164,13 @@ void log_efe_cuda_timestats_if_enabled(NegEfeContext& ctx, const Layout& L, int6
 
 }  // namespace
 
-// =============================================================================
-// Host-buffer ABI entry (NegEfeCudaHost). platform="cpu" — XLA passes host
-// buffers; GPU work runs through ctx.scratch's managed memory.
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Entry points
+// -----------------------------------------------------------------------------
+
+// Host-buffer ABI (platform="cpu"). GPU work runs through managed scratch;
+// scatter writes ctx.scratch.out_dev (owned) and D2H copies into the FFI
+// out buffer at the end.
 
 FfiError NegEfeCudaHost(NegEfeState* state, FfiS32Buf policy_matrix, FfiF32Buf qs_init, FfiF32Buf A, FfiF32Buf B,
                         FfiF32Buf C, FfiF32Buf I, FfiF32Buf pA, FfiF32Buf pB, FfiF32Buf inductive_epsilon,
@@ -1094,47 +1182,31 @@ FfiError NegEfeCudaHost(NegEfeState* state, FfiS32Buf policy_matrix, FfiF32Buf q
   const LayoutSpans spans{S_span,         O_span,          U_span,        qs_off_span,   A_off_span,
                           B_off_span,     C_off_span,      I_off_span,    I_depths_span, A_dep_flat_span,
                           A_dep_off_span, B_dep_flat_span, B_dep_off_span};
-  CallShape         shape{};
-  Layout            L{};
-  PYMDP_TRY(parse_neg_efe_layout(policy_matrix, spans, &shape, &L));
-
-  const KernelFlags parsed_flags = KernelFlags::from_bits(flags);
-
-  BufferStrides strides{};
-  EpsilonLayout epsilon{};
-  PYMDP_TRY(validate_neg_efe_runtime(shape, L, policy_matrix, qs_init, A, B, C, I, inductive_epsilon, out, &strides,
-                                     &epsilon));
-  PYMDP_TRY(validate_neg_efe_param_info_gain_buffers(parsed_flags.use_param_info_gain, shape.Bn, strides,
-                                                     pA.element_count(), pB.element_count()));
-
-  const bool pA_present = pA.element_count() > 0;
-  const bool pB_present = pB.element_count() > 0;
+  ParsedCall        pc;
+  PYMDP_TRY(
+      parse_and_validate_call(policy_matrix, qs_init, A, B, C, I, pA, pB, inductive_epsilon, out, spans, flags, &pc));
 
   NegEfeContext& ctx    = *state->ctx;
-  const int      Bn_int = static_cast<int>(shape.Bn);
+  const int      Bn_int = static_cast<int>(pc.shape.Bn);
 
-  PYMDP_TRY(prepare_caches(ctx, L, parsed_flags, Bn_int, policy_matrix.typed_data(), A.typed_data(), B.typed_data(),
-                           C.typed_data(), pA.typed_data(), pB.typed_data(), pA_present, pB_present));
+  PYMDP_TRY(prepare_caches(ctx, pc.L, pc.flags, Bn_int, policy_matrix.typed_data(), A.typed_data(), B.typed_data(),
+                           C.typed_data(), pA.typed_data(), pB.typed_data(), pc.pA_present, pc.pB_present));
 
-  log_efe_cuda_timestats_if_enabled(ctx, L, shape.Bn);
+  log_efe_cuda_timestats_if_enabled(ctx, pc.L, pc.shape.Bn);
 
-  // NegEfeCudaDev substitutes D2D upload variants for these host-pack helpers.
-  PYMDP_TRY(ensure_forward_scratch(ctx, L, parsed_flags, Bn_int, /*stream=*/nullptr));
-  upload_qs_init(ctx, L, Bn_int, qs_init.typed_data());
-  if (parsed_flags.use_inductive) {
-    PYMDP_TRY(upload_inductive_vector(ctx, L, Bn_int, qs_init.typed_data(), I.typed_data(),
-                                      inductive_epsilon.typed_data(), epsilon));
+  PYMDP_TRY(ensure_forward_scratch(ctx, pc.L, pc.flags, Bn_int, /*stream=*/nullptr, /*out_is_external=*/false));
+  upload_qs_init(ctx, pc.L, Bn_int, qs_init.typed_data());
+  if (pc.flags.use_inductive) {
+    PYMDP_TRY(upload_inductive_vector(ctx, pc.L, Bn_int, qs_init.typed_data(), I.typed_data(),
+                                      inductive_epsilon.typed_data(), pc.epsilon));
   }
-  return run_forward(ctx, L, parsed_flags, Bn_int, out->typed_data());
+  return run_forward(ctx, pc.L, pc.flags, Bn_int, ctx.scratch.out_dev.as<float>(), out->typed_data());
 }
 
-// =============================================================================
-// Device-buffer ABI entry (NegEfeCudaDev). platform="CUDA" — XLA passes
-// device buffers + stream directly, avoiding the D2H roundtrip of the host
-// path. Warm path: all caches match the prior call's device pointers → skip
-// D2H entirely; only qs_init D2D + optional inductive upload + GPU pipeline.
-// Cold path: D2H, content-hash cache-fill, record new device pointer.
-// =============================================================================
+// Device-buffer ABI (platform="CUDA"). JAX passes device buffers + stream;
+// scatter writes JAX's output directly. Warm path (all caches match the
+// prior call's devptrs) skips D2H entirely; cold path does D2H + content-tag
+// cache fill, then records the new devptrs.
 
 ffi::TypeId NegEfeState::id = {};
 
@@ -1144,22 +1216,6 @@ NegEfeState::~NegEfeState() = default;
 ffi::ErrorOr<std::unique_ptr<NegEfeState>> NegEfeCudaInstantiate() {
   return std::make_unique<NegEfeState>();
 }
-
-namespace {
-
-// Async D2H from a device buffer into a host vector. Caller is responsible
-// for synchronizing the stream before reading the host bytes.
-template <typename T> FfiError d2h_into(std::vector<T>* dst, const T* src_dev, std::size_t n, cudaStream_t stream) {
-  dst->resize(n);
-  if (n == 0) return FfiError::Success();
-  cudaError_t rc = cudaMemcpyAsync(dst->data(), src_dev, n * sizeof(T), cudaMemcpyDeviceToHost, stream);
-  if (rc != cudaSuccess) {
-    return invalid_arg(kEfeKernelName, std::string("cudaMemcpyAsync D2H failed: ") + cudaGetErrorString(rc));
-  }
-  return FfiError::Success();
-}
-
-}  // namespace
 
 FfiError NegEfeCudaDev(cudaStream_t stream, NegEfeState* state, FfiS32Buf policy_matrix, FfiF32Buf qs_init, FfiF32Buf A,
                        FfiF32Buf B, FfiF32Buf C, FfiF32Buf I, FfiF32Buf pA, FfiF32Buf pB, FfiF32Buf inductive_epsilon,
@@ -1171,95 +1227,73 @@ FfiError NegEfeCudaDev(cudaStream_t stream, NegEfeState* state, FfiS32Buf policy
   const LayoutSpans spans{S_span,         O_span,          U_span,        qs_off_span,   A_off_span,
                           B_off_span,     C_off_span,      I_off_span,    I_depths_span, A_dep_flat_span,
                           A_dep_off_span, B_dep_flat_span, B_dep_off_span};
-  CallShape         shape{};
-  Layout            L{};
-  PYMDP_TRY(parse_neg_efe_layout(policy_matrix, spans, &shape, &L));
+  ParsedCall        pc;
+  PYMDP_TRY(
+      parse_and_validate_call(policy_matrix, qs_init, A, B, C, I, pA, pB, inductive_epsilon, out, spans, flags, &pc));
 
-  const KernelFlags parsed_flags = KernelFlags::from_bits(flags);
+  NegEfeContext& ctx    = *state->ctx;
+  const int      Bn_int = static_cast<int>(pc.shape.Bn);
 
-  BufferStrides strides{};
-  EpsilonLayout epsilon{};
-  PYMDP_TRY(validate_neg_efe_runtime(shape, L, policy_matrix, qs_init, A, B, C, I, inductive_epsilon, out, &strides,
-                                     &epsilon));
-  PYMDP_TRY(validate_neg_efe_param_info_gain_buffers(parsed_flags.use_param_info_gain, shape.Bn, strides,
-                                                     pA.element_count(), pB.element_count()));
+  const DevSrcs devs{
+      .pm = policy_matrix.typed_data(),
+      .A  = A.typed_data(),
+      .B  = B.typed_data(),
+      .C  = pc.flags.use_utility ? static_cast<const void*>(C.typed_data()) : nullptr,
+      .pA = pc.pA_present ? static_cast<const void*>(pA.typed_data()) : nullptr,
+      .pB = pc.pB_present ? static_cast<const void*>(pB.typed_data()) : nullptr,
+  };
 
-  const bool pA_present = pA.element_count() > 0;
-  const bool pB_present = pB.element_count() > 0;
+  // When param_info_gain is on but pA / pB is absent, the warm-check skips
+  // the absent slot — clear any stale prior-call entry so downstream
+  // `!empty()` guards read absence correctly.
+  if (pc.flags.use_param_info_gain) {
+    if (!pc.pA_present) ctx.wa_cache.clear();
+    if (!pc.pB_present) ctx.wb_cache.clear();
+  }
 
-  const int Bn_int = static_cast<int>(shape.Bn);
-  // Per-JIT-instance: two Agents alternating on the same thread don't thrash caches.
-  NegEfeContext& ctx = *state->ctx;
-
-  // Sigs / sizes feed both the warm-path devptr check and cold-path cache keys.
-  const uint64_t pm_sig       = factor_history_pm_sig(L);
-  const int64_t  pm_size      = static_cast<int64_t>(Bn_int) * L.P * L.T * L.F;
-  const uint64_t a_sig        = a_sig_bn(L, Bn_int);
-  const int64_t  a_size       = static_cast<int64_t>(Bn_int) * L.A_off[L.M];
-  const uint64_t b_sig        = b_sig_bn(L, Bn_int);
-  const int64_t  b_size       = static_cast<int64_t>(Bn_int) * L.B_off[L.F];
-  const uint64_t linear_sig   = cuda_linear_sig(L, Bn_int);
-  const int32_t  linear_flags = (parsed_flags.use_states_info_gain ? 1 : 0) | (parsed_flags.use_utility ? 2 : 0);
-  const void*    a_dev        = A.typed_data();
-  const void*    b_dev        = B.typed_data();
-  const void*    c_dev        = parsed_flags.use_utility ? static_cast<const void*>(C.typed_data()) : nullptr;
-  const void*    pm_dev       = policy_matrix.typed_data();
-  const void*    pa_dev       = pA_present ? static_cast<const void*>(pA.typed_data()) : nullptr;
-  const void*    pb_dev       = pB_present ? static_cast<const void*>(pB.typed_data()) : nullptr;
-
-  // Warm path: same device pointers as prior call → skip D2H + cache-fill + sync.
-  const bool tree_warm   = ctx.tree_cache.match_devptr(pm_dev, pm_size, pm_sig);
-  const bool a_warm      = ctx.a_cache.match_devptr(a_dev, a_size, a_sig);
-  const bool b_warm      = ctx.b_cache.match_devptr(b_dev, b_size, b_sig);
-  const bool linear_warm = ctx.linear_cache.match_devptr(a_dev, c_dev, linear_sig, linear_flags);
-  const bool wa_warm =
-      !parsed_flags.use_param_info_gain || !pA_present || ctx.wa_cache.match_devptr(pa_dev, a_size, a_sig);
-  const bool wb_warm =
-      !parsed_flags.use_param_info_gain || !pB_present || ctx.wb_cache.match_devptr(pb_dev, b_size, b_sig);
-  const bool caches_warm = tree_warm && a_warm && b_warm && linear_warm && wa_warm && wb_warm;
-
-  if (!caches_warm) {
-    // Cold: D2H, sync, then prepare_caches. fill_*_cache may still hit by
-    // content_tag (same bytes, new pointer) — records pointer without rebuild.
+  if (!caches_are_warm(ctx, pc.L, Bn_int, pc.flags, pc.pA_present, pc.pB_present, devs)) {
+    // Tegra zero-copy on the cold-cache path. For each input buffer try the
+    // host alias first (managed/pinned memory has a host address); only D2H
+    // when JAX hands us device-only memory. The stream sync below is still
+    // required either way — prior queued ops may still be writing these
+    // buffers.
     thread_local std::vector<int32_t> pm_host;
-    thread_local std::vector<float>   A_host;
-    thread_local std::vector<float>   B_host;
-    thread_local std::vector<float>   C_host;
-    thread_local std::vector<float>   pA_host;
-    thread_local std::vector<float>   pB_host;
-    PYMDP_TRY(d2h_into(&pm_host, policy_matrix.typed_data(), policy_matrix.element_count(), stream));
-    PYMDP_TRY(d2h_into(&A_host, A.typed_data(), A.element_count(), stream));
-    PYMDP_TRY(d2h_into(&B_host, B.typed_data(), B.element_count(), stream));
-    PYMDP_TRY(d2h_into(&C_host, C.typed_data(), C.element_count(), stream));
-    if (pA_present) PYMDP_TRY(d2h_into(&pA_host, pA.typed_data(), pA.element_count(), stream));
-    if (pB_present) PYMDP_TRY(d2h_into(&pB_host, pB.typed_data(), pB.element_count(), stream));
+    thread_local std::vector<float>   A_host, B_host, C_host, pA_host, pB_host;
+    const int32_t*                    pm_ptr = nullptr;
+    const float*                      A_ptr  = nullptr;
+    const float*                      B_ptr  = nullptr;
+    const float*                      C_ptr  = nullptr;
+    const float*                      pA_ptr = nullptr;
+    const float*                      pB_ptr = nullptr;
+    PYMDP_TRY(d2h_or_alias(&pm_host, policy_matrix.typed_data(), policy_matrix.element_count(), stream, &pm_ptr));
+    PYMDP_TRY(d2h_or_alias(&A_host, A.typed_data(), A.element_count(), stream, &A_ptr));
+    PYMDP_TRY(d2h_or_alias(&B_host, B.typed_data(), B.element_count(), stream, &B_ptr));
+    if (pc.flags.use_utility) PYMDP_TRY(d2h_or_alias(&C_host, C.typed_data(), C.element_count(), stream, &C_ptr));
+    if (pc.pA_present) PYMDP_TRY(d2h_or_alias(&pA_host, pA.typed_data(), pA.element_count(), stream, &pA_ptr));
+    if (pc.pB_present) PYMDP_TRY(d2h_or_alias(&pB_host, pB.typed_data(), pB.element_count(), stream, &pB_ptr));
     if (cudaError_t rc = cudaStreamSynchronize(stream); rc != cudaSuccess) {
       return invalid_arg(kEfeKernelName,
                          std::string("cudaStreamSynchronize before host work failed: ") + cudaGetErrorString(rc));
     }
-    PYMDP_TRY(prepare_caches(ctx, L, parsed_flags, Bn_int, pm_host.data(), A_host.data(), B_host.data(), C_host.data(),
-                             pA_present ? pA_host.data() : nullptr, pB_present ? pB_host.data() : nullptr, pA_present,
-                             pB_present, DevSrcs{pm_dev, a_dev, b_dev, C.typed_data(), pa_dev, pb_dev}));
+    PYMDP_TRY(prepare_caches(ctx, pc.L, pc.flags, Bn_int, pm_ptr, A_ptr, B_ptr, C_ptr, pA_ptr, pB_ptr, pc.pA_present,
+                             pc.pB_present, devs));
   }
 
-  // Non-owning view into JAX's output buffer; scatter writes there directly.
-  const size_t out_bytes = static_cast<size_t>(shape.Bn) * shape.P * sizeof(float);
-  if (static_cast<int64_t>(out->element_count()) != shape.Bn * shape.P) {
+  // JAX's output device buffer flows straight through StageCtx.out_dev_ptr
+  // into launch_final_scatter — never stored in a CuArr, so ensure() / reset()
+  // can't free a JAX-owned pointer.
+  if (static_cast<int64_t>(out->element_count()) != pc.shape.Bn * pc.shape.P) {
     return invalid_arg(kEfeKernelName, "out element_count " + std::to_string(out->element_count()) +
-                                           " != Bn*P = " + std::to_string(shape.Bn * shape.P));
+                                           " != Bn*P = " + std::to_string(pc.shape.Bn * pc.shape.P));
   }
-  ctx.scratch.out_dev = CuArr::view(out->typed_data(), out_bytes);
 
-  PYMDP_TRY(ensure_forward_scratch(ctx, L, parsed_flags, Bn_int, stream));
-
-  PYMDP_TRY(upload_qs_init_d2d(ctx, L, Bn_int, qs_init.typed_data(), stream));
-  if (parsed_flags.use_inductive) {
-    // v_full is computed on-device; no host roundtrip even when use_inductive.
-    PYMDP_TRY(upload_inductive_vector_d2d(ctx, L, Bn_int, qs_init.typed_data(), I.typed_data(),
-                                          inductive_epsilon.typed_data(), epsilon, stream));
+  PYMDP_TRY(ensure_forward_scratch(ctx, pc.L, pc.flags, Bn_int, stream, /*out_is_external=*/true));
+  PYMDP_TRY(upload_qs_init_d2d(ctx, pc.L, Bn_int, qs_init.typed_data(), stream));
+  if (pc.flags.use_inductive) {
+    PYMDP_TRY(upload_inductive_vector_d2d(ctx, pc.L, Bn_int, qs_init.typed_data(), I.typed_data(),
+                                          inductive_epsilon.typed_data(), pc.epsilon, stream));
   }
-  PYMDP_TRY(run_forward(ctx, L, parsed_flags, Bn_int, /*out_host_or_null=*/nullptr, stream));
-
+  PYMDP_TRY(run_forward(ctx, pc.L, pc.flags, Bn_int, out->typed_data(), /*out_host_or_null=*/nullptr, stream));
   return FfiError::Success();
 }
 

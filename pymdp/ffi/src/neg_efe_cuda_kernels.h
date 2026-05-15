@@ -54,10 +54,17 @@ struct BRolloutParents {
   int          S[kBRolloutMaxParents];  // state-space size per parent factor
 };
 
-cudaError_t launch_b_rollout_general(const float* B, const float* wB_tr, const int32_t* action_h,
-                                     const int32_t* parent_histories, const BRolloutParents& parents, int n_parents,
-                                     int Bn, int Nh, int S_f, int K_f, int U_f, float* qs_out, float* factor_score,
-                                     cudaStream_t stream);
+// `v_full` (when non-null and `ind_score_t_f` is also non-null) folds the
+// per-(t, f) inductive score `sum_s qs_out[b, h, s] * v_full[b, qs_off_f + s]`
+// into the same block as phase 2: each thread that owns an s-stripe in
+// phase 2 accumulates the inductive partial alongside the factor_score
+// partial; both reduce via b_rollout_block_reduce_sum_lane0. `ind_score_t_f` is
+// the per-(t, f) base within inductive_concat [Bn, ind_b_stride].
+cudaError_t launch_b_rollout_general(const float* B, const float* wB_tr, const float* v_full, int qs_flat, int qs_off_f,
+                                     const int32_t* action_h, const int32_t* parent_histories,
+                                     const BRolloutParents& parents, int n_parents, int Bn, int Nh, int S_f, int K_f,
+                                     int U_f, float* qs_out, float* factor_score, float* ind_score_t_f,
+                                     int64_t ind_b_stride, cudaStream_t stream);
 
 // Per-modality factor-history scoring kernels.
 //
@@ -89,13 +96,6 @@ cudaError_t launch_modality_score_dedup_rank3_stage2(const float* tmp_qo, const 
                                                      int H_split, int S_split, int64_t b_stride, bool use_states,
                                                      bool use_linear, bool use_pA, float* score_out,
                                                      cudaStream_t stream);
-
-// Inductive per-factor: ind_score_out[b, h_f] = sum_s qs_f[b, h_f, s] *
-// v_full[b, qs_off_f + s]. One thread per (b, h_f). ind_score_out points
-// to the per-(t, f) slice within inductive_concat [Bn, total_ind];
-// b_stride = total_ind.
-cudaError_t launch_inductive_per_factor(const float* qs_f, const float* v_full, int Bn, int H_f, int S_f, int qs_flat,
-                                        int qs_off_f, int64_t b_stride, float* ind_score_out, cudaStream_t stream);
 
 // Per-factor inductive coefficient v_full. Equivalent to the host-side
 // precompute_inductive in neg_efe_precompute.h:
