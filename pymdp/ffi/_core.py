@@ -89,17 +89,21 @@ def dep_indices_in_range(deps: Sequence[int], num_factors: int) -> bool:
     return all(0 <= d < num_factors for d in deps)
 
 
-def _register(target_name: str, symbol_name: str | None = None) -> None:
-    if target_name in _registered_ffi_targets:
+def _register(target_name: str, symbol_name: str | None = None, platform: str = "cpu") -> None:
+    # Register key is (target_name, platform) so a target available on both
+    # CPU and CUDA can be registered twice with different symbols pointing
+    # at distinct C entry points.
+    key = f"{target_name}@{platform}"
+    if key in _registered_ffi_targets:
         return
     lib = _require_loaded_lib(registering_target=target_name)
     symbol = getattr(lib, symbol_name or target_name)  # pyright: ignore[reportAny]
     jax.ffi.register_ffi_target(
         target_name,
         jax.ffi.pycapsule(symbol),  # pyright: ignore[reportUnknownMemberType,reportAny]
-        platform="cpu",
+        platform=platform,
     )
-    _registered_ffi_targets.add(target_name)
+    _registered_ffi_targets.add(key)
 
 
 def _data_pycapsule(addr: int) -> object:

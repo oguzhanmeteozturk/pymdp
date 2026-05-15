@@ -1,33 +1,32 @@
 cmake_minimum_required(VERSION 3.18)
 project(pymdp_ffi LANGUAGES CXX)
 
-# Build the shared pymdp FFI library used by JAX/XLA at runtime.
-# This library is loaded through ctypes and wrapped in a PyCapsule on the
-# Python side, so it does not need direct Python linkage.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Export compile_commands.json for tools like clang-tidy so they can inspect
-# the same include paths and flags used by this build.
+# Emit compile_commands.json so clang-tidy (driven from the repo-root Makefile)
+# can resolve includes and flags without re-deriving the build invocation.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Default to Release when no build type is provided. This ensures the NEON
-# kernels are optimized instead of falling back to an unvectorized code path.
+# Without this, CMake picks no optimization flag when CMAKE_BUILD_TYPE is unset
+# and our hand-rolled NEON helpers run unvectorized -- 10x slower than cblas.
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# Enable link-time optimization by default. LTO lets the shared NEON helper
-# code in kernel_primitives.h be cross-module inlined across the FFI target.
-# On AppleClang this becomes thin LTO; on GCC it enables the linker plugin.
-# Disable with -DPYMDP_FFI_LTO=OFF for faster edit/compile cycles.
+# LTO/IPO. On AppleClang this picks -flto=thin; on GCC it picks -flto with the
+# linker plugin. Default ON since both production targets (M3 Max, Jetson Nano)
+# benefit from cross-TU inlining of the shared NEON helpers in
+# kernel_primitives.h that are #included into both neg_efe_cpu.cc and fpi.cc.
+# Disable with -DPYMDP_FFI_LTO=OFF for faster iteration builds.
 option(PYMDP_FFI_LTO "Enable link-time optimization (LTO)" ON)
 
-# Enable optional CUDA kernel support for Jetson Nano and newer devices.
-# This is off by default because most development hosts do not have nvcc / the
-# CUDA toolkit installed. Use -DPYMDP_FFI_CUDA=ON to build, and set
-# PYMDP_FFI_USE_CUDA=1 at runtime to activate the CUDA path.
+# CUDA kernels — Jetson Nano (Maxwell SM 5.3) and beyond. Off by default on
+# every host since nvcc / CUDA toolkit aren't present on most dev machines.
+# Selected at build time via -DPYMDP_FFI_CUDA=ON; at runtime via
+# PYMDP_FFI_USE_CUDA=1. When disabled the symbol
+# isn't registered and the env var has no effect.
 option(PYMDP_FFI_CUDA "Build CUDA neg-EFE kernel (Jetson Nano sm_53 baseline)" OFF)
 
 find_package(Python COMPONENTS Interpreter REQUIRED)
@@ -44,29 +43,37 @@ if(NOT _jax_ffi_rc EQUAL 0)
 endif()
 message(STATUS "JAX FFI include dir: ${JAX_FFI_INCLUDE_DIR}")
 
-# Build a shared library loaded via ctypes. Python integration happens through
-# jax.ffi.pycapsule, so the library does not need direct Python linkage.
+# Plain shared library; loaded at runtime with ctypes. No Python linkage needed —
+# the C symbol is wrapped into a PyCapsule by jax.ffi.pycapsule.
 set(_pymdp_ffi_sources
     src/neg_efe_cpu.cc
     src/xla_register.cc
     src/fpi.cc
 )
-# Enable CUDA only when requested. CUDA source files must be known before
-# add_library, so enable_language(CUDA) is called inside the branch.
-# This keeps non-CUDA builds independent of the CUDA toolchain.
+# enable_language(CUDA) must run before add_library so .cu sources are
+# recognized. Scoped to the PYMDP_FFI_CUDA branch so non-Jetson builds don't
+# require a CUDA toolchain.
 if(PYMDP_FFI_CUDA)
-    # Split CUDA into host glue and device kernels. The host-side file
-    # neg_efe_cuda.cc is built with the host C++ compiler so it can include
-    # XLA FFI api.h, while the device kernels in neg_efe_cuda_kernels.cu only
-    # depend on a small launch-wrapper header.
-    # This avoids nvcc frontend failures when compiling XLA FFI headers.
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 14)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    set(CMAKE_CUDA_EXTENSIONS OFF)
+    # Host-side glue (FFI entry point, runtime API calls like
+    # cudaGetDeviceProperties) lives in neg_efe_cuda.cc — compiled by the
+    # host C++ compiler so it can include XLA FFI api.h. Device kernels
+    # live in neg_efe_cuda_kernels.cu and only see a small launch-wrapper
+    # header (neg_efe_cuda_kernels.h). Splitting the TUs is required:
+    # XLA FFI's api.h is C++17-heavy and nvcc 10.2's frontend rejects it
+    # ("qualified name is not allowed" on parametrized template member
+    # access).
     # Default to host-GPU arch detection (CMake 3.24+ understands `native` and
     # asks nvcc to probe the local devices). Falls back to sm_53 (Jetson Nano
     # baseline) on older CMake. Override with -DCMAKE_CUDA_ARCHITECTURES=86 etc.
+    #
+    # MUST run before enable_language(CUDA) — enable_language calls into
+    # CMakeCUDAInformation, which sets CMAKE_CUDA_ARCHITECTURES to its own
+    # default (sm_52 with nvcc 11/12). After that point the `NOT DEFINED`
+    # check below would always be false, and `native` would never fire —
+    # leaving Orin (sm_87) / ws0 (sm_86) builds JIT'ing from a Maxwell
+    # baseline at runtime. Hoisting the resolution above enable_language
+    # lets us bypass the CMake default and request `native` (or the user's
+    # -DCMAKE_CUDA_ARCHITECTURES override) cleanly.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
             set(CMAKE_CUDA_ARCHITECTURES native)
@@ -74,43 +81,64 @@ if(PYMDP_FFI_CUDA)
             set(CMAKE_CUDA_ARCHITECTURES 53)
         endif()
     endif()
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 14)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_EXTENSIONS OFF)
     list(APPEND _pymdp_ffi_sources
         src/neg_efe_cuda.cc
         src/neg_efe_cuda_kernels.cu
         src/neg_efe_cuda_memory.h
         src/neg_efe_cuda_context.h
+        src/fpi_cuda_kernels.cu
+        src/fpi_cuda_kernels.h
     )
 endif()
 add_library(pymdp_ffi SHARED ${_pymdp_ffi_sources})
-# Force -O3 and fast-math for host C++ compilation only, scoped to this
-# target so the flags do not propagate to parent projects. CUDA uses a
-# different device-specific fast-math flag below.
+# Belt-and-suspenders: even for Release, force -O3 + target-native codegen so
+# the NEON intrinsics in kernel_primitives.h are fully inlined. Scoped to this
+# target (not add_compile_options) so -ffast-math doesn't leak into a parent
+# CMake build that includes us — fast-math changes IEEE semantics and that
+# surprise is unwelcome elsewhere.
+# Host C++ only — nvcc takes a different flag spelling (-Xcompiler / --use_fast_math)
+# and would error on bare -ffast-math when compiling .cu sources. CUDA-specific
+# flags are added below in the PYMDP_FFI_CUDA block.
 target_compile_options(pymdp_ffi PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3 -ffast-math>
 )
 
 # Per-target codegen. On Apple silicon, AppleClang's default already targets the
-# host (apple-m1+), so we leave -mcpu unset and let the compiler pick. On
-# non-Apple aarch64 we assume Jetson Nano (Cortex-A57, ARMv8.0 — only baseline
-# NEON, no fp16 vector arithmetic). -mcpu=cortex-a57 enables tuning for the
-# in-order pipeline and matches PYMDP_FFI_DISABLE_F16=1 expectations in
-# kernel_primitives.h. Pass to the linker too so LTO codegen sees it.
+# host (apple-m1+), so we leave -mcpu unset. On non-Apple aarch64 we default to
+# `-mcpu=native` so the compiler picks up the host part — Cortex-A57 (Jetson
+# Nano, v8.0) gets in-order scheduling, Cortex-A78AE (Orin NX, v8.2) gets the
+# 4-wide out-of-order tune plus DOTPROD and FP16 vector arithmetic. Override
+# with -DPYMDP_FFI_AARCH64_MCPU=cortex-a57 for portable Jetson-Nano-class
+# builds (or any cross-compile where the build host isn't the run host).
+# Pinning to cortex-a57 across all aarch64 — the prior default — was a
+# substantial regression on A78AE: it locked the scheduler to A57's in-order
+# pipeline and dropped v8.2 ISA features the host actually supports.
 if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    message(STATUS "Targeting Cortex-A57 (Jetson Nano)")
+    set(PYMDP_FFI_AARCH64_MCPU "native" CACHE STRING
+        "GCC -mcpu target for aarch64 builds (default 'native'; set to e.g. cortex-a57 for portable Jetson Nano builds).")
+    message(STATUS "Targeting aarch64 -mcpu=${PYMDP_FFI_AARCH64_MCPU}")
     # Host C++ only — same reasoning as the -O3/-ffast-math scope above.
     target_compile_options(pymdp_ffi PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-mcpu=cortex-a57>
+        $<$<COMPILE_LANGUAGE:CXX>:-mcpu=${PYMDP_FFI_AARCH64_MCPU}>
     )
-    target_link_options(pymdp_ffi PRIVATE -mcpu=cortex-a57)
+    target_link_options(pymdp_ffi PRIVATE -mcpu=${PYMDP_FFI_AARCH64_MCPU})
 endif()
 
-# Enable host-native x86_64 codegen by default so the compiler can use the
-# local microarchitecture's vector instruction set. Turn this off for portable
-# or cross-build scenarios.
+# x86_64 hosts: enable host-native codegen so AVX2/FMA/AVX-512 intrinsics in
+# kernel_primitives.h compile and the compiler unlocks the matching auto-vec
+# paths for the scalar fallbacks. Default ON; turn off for portable builds.
+# -march=native sets both ISA-availability and tuning to the build host; the
+# resulting binary is not portable to older x86 microarchitectures.
 option(PYMDP_FFI_X86_NATIVE "Build with -march=native on x86_64 hosts" ON)
-# AVX-512F remains opt-in because it can be slower than AVX2 on many systems.
-# Enable only on hosts with a well-behaved AVX-512 implementation after
-# benchmarking.
+# AVX-512F intrinsics in kernel_primitives.h are opt-in even when the build
+# host defines __AVX512F__: the AVX-512 path lost to AVX2 on every pymdp
+# fixture on Ice Lake-SP (frequency throttle on sustained 512-bit FMA + slow
+# horizontal-reduce on small inner-n sgemv). Opt in for Sapphire Rapids /
+# Zen 4 hosts where the throttle is lighter; benchmark before flipping.
 option(PYMDP_FFI_ENABLE_AVX512 "Compile in AVX-512F SIMD path on x86_64 hosts" OFF)
 if(PYMDP_FFI_X86_NATIVE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     message(STATUS "Targeting host x86 microarch (-march=native)")
@@ -184,8 +212,12 @@ else()
 endif()
 
 if(PYMDP_FFI_CUDA)
-    # Find and link the CUDA runtime and cuBLAS libraries. The explicit link
-    # is a safety net for the host-side CUDA glue code that calls runtime APIs.
+    # CUDAToolkit (CMake 3.17+) is the modern way to find cudart. CMake
+    # also auto-links cudart when CUDA language is enabled, so the explicit
+    # link is belt-and-suspenders for the host .cc which calls runtime API
+    # directly. Add CUDA::cudart_static if a self-contained dylib becomes
+    # important; for now the shared cudart on the JetPack loader path is
+    # the right call.
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(pymdp_ffi PRIVATE CUDA::cudart CUDA::cublas)
     target_compile_definitions(pymdp_ffi PRIVATE PYMDP_FFI_HAS_CUDA=1)
@@ -197,5 +229,20 @@ if(PYMDP_FFI_CUDA)
     target_compile_options(pymdp_ffi PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
     )
+    # ptxas -v: per-kernel register usage, spill stores/loads, smem,
+    # constant-mem, and SASS bytes. Goes to stderr at compile time. Default
+    # ON because the pymdp CUDA kernels are register-pressure-sensitive
+    # (see feedback_fpi_cuda_no_op_changes: a "logically free" loop
+    # reorganization regressed fpi_large by 9% via codegen perturbation
+    # that ptxas output would have flagged before bench). One line per
+    # __global__ kernel — cheap to read, expensive not to have.
+    option(PYMDP_FFI_CUDA_PTXAS_VERBOSE
+        "Pass -Xptxas=-v so nvcc reports per-kernel regs/spills/smem/SASS bytes" ON)
+    if(PYMDP_FFI_CUDA_PTXAS_VERBOSE)
+        target_compile_options(pymdp_ffi PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
+        )
+        message(STATUS "ptxas verbose: enabled (per-kernel regs/spills/smem on every CUDA build)")
+    endif()
     message(STATUS "CUDA kernels: enabled (CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES})")
 endif()

@@ -264,12 +264,19 @@ def update_posterior_policies(
     # FFI fast path: same fused C++ kernel as the inductive variant, with the
     # inductive flag off. Dummy I and zero epsilon satisfy the ABI; the kernel
     # validates their shape but skips inductive precompute when use_inductive=False.
+    _pm_shape = jnp.shape(policy_matrix)
+    _work_proxy = (
+        int(_pm_shape[0]) * int(_pm_shape[1]) * sum(int(q.shape[0]) for q in qs_init)
+        if len(_pm_shape) >= 2 and qs_init
+        else None
+    )
     if _ffi.can_handle(
         A_dependencies,
         B_dependencies,
         use_param_info_gain,
         num_factors=len(qs_init),
         num_modalities=len(A),
+        work_proxy=_work_proxy,
     ):
         I_dummy = [jnp.zeros((1, q.shape[0]), dtype=jnp.float32) for q in qs_init]
         eps_dummy = jnp.float32(0.0)
@@ -866,12 +873,19 @@ def update_posterior_policies_inductive(
     # is fine — the kernel uses vmap_method="broadcast_all" and iterates over
     # the batch internally. ffi.with_jax_grad routes the gradient backward
     # through the JAX vmap path since ffi_call has no native JVP rule.
+    _pm_shape = jnp.shape(policy_matrix)
+    _work_proxy = (
+        int(_pm_shape[0]) * int(_pm_shape[1]) * sum(int(q.shape[0]) for q in qs_init)
+        if len(_pm_shape) >= 2 and qs_init
+        else None
+    )
     if _ffi.can_handle(
         A_dependencies,
         B_dependencies,
         use_param_info_gain,
         num_factors=len(qs_init),
         num_modalities=len(A),
+        work_proxy=_work_proxy,
     ):
         # pA/pB are captured by closure rather than threaded through the
         # custom_vjp args; same rationale as the non-inductive dispatch above.

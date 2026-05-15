@@ -50,20 +50,109 @@ def _register_neg_efe_state_multistage(
     )
 
 
-def _use_cuda_target(B_dependencies: Sequence[Sequence[int]]) -> bool:
+def _register_all_efe_targets_eager() -> None:
+    """Register every neg-EFE FFI target the build can offer, at import time.
+
+    Lazy registration (inside ``neg_efe_all_policies_ffi``) fires
+    ``jax.ffi.register_ffi_type`` mid-JIT-trace on the first call. On Orin
+    that perturbs the FFI TypeRegistry's internal storage *after* Mosaic-GPU
+    has already cached a reference into it for its softmax / device-handle
+    CustomCalls — the cached reference goes stale, and the next destructor
+    of a Mosaic-emitted ExecutionState calls through the stale lambda into
+    freed memory (SIGSEGV at ``stream_executor::DeviceAddressHandle::~``).
+    See ``pymdp/ffi/__init__.py`` docstring for the full crash chain.
+
+    Eagerly registering at module-import time lets the TypeRegistry settle
+    *before* Mosaic-GPU forms any caches, so when those caches do form (at
+    first JIT compile) the references they capture stay valid for the
+    process lifetime. No-op when the FFI lib is absent or built without
+    CUDA (CPU target alone always registers).
+    """
+    if not is_available():
+        return
+    # CPU fallback target — works on every platform, used when use_cuda is
+    # False (e.g., PYMDP_FFI_USE_CUDA unset).
+    _register("pymdp_neg_efe_all_policies", platform="cpu")
+    caps = ffi_capabilities()
+    if not caps.get("cuda", False):
+        return
+    # CUDA-host multi-stage target (platform="cpu") and CUDA-dev multi-stage
+    # target (platform="CUDA"). We intentionally do NOT gate on
+    # has_jax_cuda_backend() here: that helper calls jax.devices() which
+    # forces backend init, and on Tegra that init runs *after* the
+    # cuda_host multi-stage registration has happened but *before* the
+    # cuda_dev one — at which point XLA's CPU backend trips its
+    # "Types used by FFI handlers must be registered before the handler
+    # registration" precondition and the whole jax.devices() call raises,
+    # leaving the cuda_dev target unregistered. The CUDA target registry is
+    # platform-keyed in JAX, so registering on a host without a CUDA
+    # backend is just a no-op entry in the table — it never gets resolved
+    # by a non-CUDA JIT. Registering unconditionally also keeps the
+    # TypeRegistry stable: by the time any backend init runs, every
+    # platform variant we'll ever use is already in the table.
+    _register_neg_efe_state_multistage(
+        target_name="pymdp_neg_efe_all_policies_cuda_host",
+        instantiate_symbol="pymdp_neg_efe_all_policies_cuda_host_instantiate",
+        execute_symbol="pymdp_neg_efe_all_policies_cuda_host",
+        platform="cpu",
+    )
+    _register_neg_efe_state_multistage(
+        target_name="pymdp_neg_efe_all_policies_cuda_dev",
+        instantiate_symbol="pymdp_neg_efe_cuda_dev_instantiate",
+        execute_symbol="pymdp_neg_efe_cuda_dev_execute",
+        platform="CUDA",
+    )
+
+
+# CUDA dispatch overhead amortization threshold. The neg-EFE kernel runs as a
+# multi-stage pipeline (factor scoring + per-modality scoring + scatter); each
+# stage launches at least one device kernel. On Maxwell sm_53 the per-launch
+# latency totals ~1ms across the pipeline, so problems below ~10K work units
+# (P * T * sum(S_f), the per-batch-element work proxy) regress vs the JAX
+# fallback. Measured: agent_step (24*1*18 = 432) was +22% over JAX baseline,
+# while the inductive fixtures (~93K) clear it by 200x. Override with the
+# PYMDP_FFI_CUDA_MIN_WORK env var; set to 0 to disable the gate.
+_CUDA_MIN_WORK_DEFAULT = 10000
+
+
+def _cuda_min_work() -> int:
+    raw = os.environ.get("PYMDP_FFI_CUDA_MIN_WORK", "").strip()
+    if not raw:
+        return _CUDA_MIN_WORK_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _CUDA_MIN_WORK_DEFAULT
+
+
+def _use_cuda_target(
+    B_dependencies: Sequence[Sequence[int]],
+    *,
+    work_proxy: int | None = None,
+) -> bool:
     """Predicate: should the CUDA FFI target be used over the CPU one?
 
     True when all three hold:
       * `PYMDP_FFI_USE_CUDA` env var is set to a truthy value (opt-in),
       * the loaded lib was built with CUDA support (`ffi_capabilities()["cuda"]`),
       * every factor's B_dependencies rank is within the kernel's parent-rank cap.
+
+    When ``work_proxy`` (P * T * sum(S_f) per batch element) is provided and
+    falls below ``PYMDP_FFI_CUDA_MIN_WORK``, the CUDA target is declined so the
+    caller falls through — to CPU FFI on a CPU-backend host (CPU targets
+    register with platform="cpu" and are reachable), or to the JAX vmap on a
+    CUDA-backend host (CPU targets are invisible to the CUDA jit there).
     """
     flag = os.environ.get("PYMDP_FFI_USE_CUDA", "").strip().lower()
     if flag in ("", "0", "false", "no"):
         return False
     if not ffi_capabilities().get("cuda"):
         return False
-    return all(dep_list_rank_ok(d) for d in B_dependencies)
+    if not all(dep_list_rank_ok(d) for d in B_dependencies):
+        return False
+    if work_proxy is not None and work_proxy < _cuda_min_work():
+        return False
+    return True
 
 
 def can_handle(
@@ -73,6 +162,7 @@ def can_handle(
     *,
     num_factors: int | None = None,
     num_modalities: int | None = None,
+    work_proxy: int | None = None,
 ) -> bool:
     """Fast predicate: can the FFI kernel handle this problem?
 
@@ -91,13 +181,19 @@ def can_handle(
     Note on use_param_info_gain: supported on CPU and CUDA; the kernels compute
     the pA/pB novelty (Dirichlet information-gain) terms via precomputed wA /
     wB weights derived from the spm_wnorm formula.
+
+    Note on work_proxy: callers on a CUDA-backend host can pass the per-batch
+    work proxy (P * T * sum(S_f)); when below ``PYMDP_FFI_CUDA_MIN_WORK`` the
+    gate declines so the JAX vmap handles the call (CPU FFI is invisible to the
+    CUDA jit). Omitting work_proxy preserves prior behavior (FFI always wins on
+    CPU-backend hosts).
     """
     if not is_available():
         return False
     # CPU FFI targets are registered with platform="cpu" and are invisible to
     # the CUDA JIT.  On a CUDA-backend host, only allow dispatch when the CUDA
     # kernel path is actually selected; otherwise JAX handles the call.
-    if has_jax_cuda_backend() and not _use_cuda_target(B_dependencies):
+    if has_jax_cuda_backend() and not _use_cuda_target(B_dependencies, work_proxy=work_proxy):
         return False
     if num_modalities is not None and len(A_dependencies) != num_modalities:
         return False
@@ -266,7 +362,19 @@ def neg_efe_all_policies_ffi(
     # JIT compiles in the device-pointer path on CUDA and the host-buffer
     # path on CPU. On Jetson Nano (CPU-only jaxlib), has_jax_cuda_backend()
     # is False and only the host-buffer target is registered.
-    use_cuda = _use_cuda_target(B_dependencies)
+    # Compute work proxy from concrete shapes so the CUDA gate matches the
+    # decision can_handle made upstream. P * T * sum(S_f) is the per-batch
+    # work, ignoring batch_size (vmap_method="broadcast_all" handles that
+    # internally and dispatch overhead is the same per call).
+    pm_shape = np.shape(policy_matrix)
+    if len(pm_shape) >= 2:
+        _wp_P = int(pm_shape[0])
+        _wp_T = int(pm_shape[1])
+        _wp_S = sum(int(np.shape(q)[0]) for q in qs_init) if qs_init else 0
+        _work_proxy: int | None = _wp_P * _wp_T * _wp_S
+    else:
+        _work_proxy = None
+    use_cuda = _use_cuda_target(B_dependencies, work_proxy=_work_proxy)
     use_cuda_dev = use_cuda and has_jax_cuda_backend()
 
     if use_cuda:
