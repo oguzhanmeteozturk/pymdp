@@ -2,9 +2,11 @@
 
 Build the extension with:
 
-    cmake -S pymdp/ffi -B pymdp/ffi/build -G "Unix Makefiles" \\
-        -DPython_EXECUTABLE=$(pwd)/.venv/bin/python3.14
-    cmake --build pymdp/ffi/build
+    uv sync --group build
+    make ffi-build
+
+Settings live in ``pyproject.toml`` under ``[tool.pymdp.ffi]``.
+``CMAKE_FLAGS="-DPYMDP_FFI_CUDA=ON" make ffi-build`` for CUDA builds.
 
 The resulting ``libpymdp_ffi.dylib`` / ``.so`` is expected at
 ``pymdp/ffi/build/``. Set ``PYMDP_FFI_LIB`` to override the path.

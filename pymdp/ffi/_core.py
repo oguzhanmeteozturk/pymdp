@@ -55,9 +55,7 @@ def _load_library() -> None:
         # via system python and fails with ModuleNotFoundError.
         _load_error = FileNotFoundError(
             f"pymdp FFI library not found at {path}. "
-            + "Build with: cmake -S pymdp/ffi -B pymdp/ffi/build -G 'Unix Makefiles' "
-            + "-DPython_EXECUTABLE=$(which python) "
-            + "&& cmake --build pymdp/ffi/build"
+            + "Build with: uv sync --group build && make ffi-build"
         )
         return
     try:

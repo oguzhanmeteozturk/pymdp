@@ -38,6 +38,9 @@ dependencies = [
 ]
 
 [dependency-groups]
+build = [
+    "cmake>=4.3.2",
+]
 dev = [
     "nbformat>=5.10.4",
     "nbstripout>=0.8.2",
@@ -130,6 +133,19 @@ omit = [
 precision = 2
 show_missing = true
 skip_covered = false
+
+[tool.pymdp.ffi]
+source-dir = "pymdp/ffi"
+build-dir = "pymdp/ffi/build"
+generator = "Unix Makefiles"
+build-type = "Release"
+python = ".venv/bin/python"
+# CUDA build mode passed to CMake: auto (detect nvcc), on, or off.
+cuda = "auto"
+
+# Extra -D flags for configure. Override at build time with the CMAKE_FLAGS env
+# var (space-separated), or PYMDP_FFI_CUDA=ON/OFF/AUTO.
+[tool.pymdp.ffi.cmake-defines]
 
 [tool.uv.sources]
 pybefit = { git = "https://github.com/dimarkov/pybefit.git" }
