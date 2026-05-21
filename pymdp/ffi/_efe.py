@@ -227,6 +227,7 @@ def _validate_efe_inputs(
     use_inductive: bool,
     use_param_info_gain: bool,
     inductive_epsilon: float,
+    work_proxy: int | None = None,
 ) -> None:
     F = len(qs_init)
     M = len(A)
@@ -236,12 +237,18 @@ def _validate_efe_inputs(
         raise ValueError("B and I must have one entry per hidden-state factor")
     if len(C) != M:
         raise ValueError("C must have one entry per observation modality")
+    # work_proxy is threaded in so the gate's decision matches the dispatch
+    # path below: _use_cuda_target consults work_proxy to skip small
+    # workloads on CUDA-backend hosts (CPU FFI targets are invisible to the
+    # CUDA jit), and can_handle must use the same input or the validator
+    # accepts calls that later fail at FFI lookup time.
     if not can_handle(
         A_dependencies,
         B_dependencies,
         use_param_info_gain=use_param_info_gain,
         num_factors=F,
         num_modalities=M,
+        work_proxy=work_proxy,
     ):
         raise ValueError("unsupported or inconsistent A/B dependency metadata")
 
@@ -413,6 +420,7 @@ def neg_efe_all_policies_ffi(
         use_inductive=use_inductive,
         use_param_info_gain=use_param_info_gain,
         inductive_epsilon=inductive_epsilon,
+        work_proxy=_work_proxy,
     )
 
     # C is broadcast to the kernel's `(T, O_m)` ABI; shape attrs are int64.

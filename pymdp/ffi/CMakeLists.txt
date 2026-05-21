@@ -18,7 +18,7 @@ endif()
 # LTO/IPO. On AppleClang this picks -flto=thin; on GCC it picks -flto with the
 # linker plugin. Default ON since both production targets (M3 Max, Jetson Nano)
 # benefit from cross-TU inlining of the shared NEON helpers in
-# kernel_primitives.h that are #included into both neg_efe_cpu.cc and fpi.cc.
+# kernel_primitives.h that are #included into both neg_efe_cpu_*.cc and fpi_cpu_runner.cc.
 # Disable with -DPYMDP_FFI_LTO=OFF for faster iteration builds.
 option(PYMDP_FFI_LTO "Enable link-time optimization (LTO)" ON)
 
@@ -46,19 +46,20 @@ message(STATUS "JAX FFI include dir: ${JAX_FFI_INCLUDE_DIR}")
 # Plain shared library; loaded at runtime with ctypes. No Python linkage needed —
 # the C symbol is wrapped into a PyCapsule by jax.ffi.pycapsule.
 set(_pymdp_ffi_sources
-    src/neg_efe_cpu.cc
-    src/xla_register.cc
-    src/fpi.cc
+    src/neg_efe/neg_efe_cpu_entry.cc
+    src/neg_efe/neg_efe_cpu_pipeline.cc
+    src/registration/xla_register.cc
+    src/fpi/fpi_cpu_runner.cc
 )
 # enable_language(CUDA) must run before add_library so .cu sources are
 # recognized. Scoped to the PYMDP_FFI_CUDA branch so non-Jetson builds don't
 # require a CUDA toolchain.
 if(PYMDP_FFI_CUDA)
     # Host-side glue (FFI entry point, runtime API calls like
-    # cudaGetDeviceProperties) lives in neg_efe_cuda.cc — compiled by the
-    # host C++ compiler so it can include XLA FFI api.h. Device kernels
-    # live in neg_efe_cuda_kernels.cu and only see a small launch-wrapper
-    # header (neg_efe_cuda_kernels.h). Splitting the TUs is required:
+    # cudaGetDeviceProperties) lives in neg_efe_cuda_{cache,launch,runtime,entry}.cc
+    # — compiled by the host C++ compiler so they can include XLA FFI api.h.
+    # Device kernels live in neg_efe_cuda_kernels.cu and only see a small
+    # launch-wrapper header (neg_efe_cuda_kernels.h). Splitting the TUs is required:
     # XLA FFI's api.h is C++17-heavy and nvcc 10.2's frontend rejects it
     # ("qualified name is not allowed" on parametrized template member
     # access).
@@ -86,15 +87,22 @@ if(PYMDP_FFI_CUDA)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     set(CMAKE_CUDA_EXTENSIONS OFF)
     list(APPEND _pymdp_ffi_sources
-        src/neg_efe_cuda.cc
-        src/neg_efe_cuda_kernels.cu
-        src/neg_efe_cuda_memory.h
-        src/neg_efe_cuda_context.h
-        src/fpi_cuda_kernels.cu
-        src/fpi_cuda_kernels.h
+        src/neg_efe/neg_efe_cuda_cache.cc
+        src/neg_efe/neg_efe_cuda_entry.cc
+        src/neg_efe/neg_efe_cuda_launch.cc
+        src/neg_efe/neg_efe_cuda_runtime.cc
+        src/neg_efe/neg_efe_cuda_kernels.cu
+        src/neg_efe/neg_efe_cuda_context.h
+        src/neg_efe/neg_efe_cuda_internal.h
+        src/fpi/fpi_cuda_cache.cc
+        src/fpi/fpi_cuda_host_shim.cc
+        src/fpi/fpi_cuda_kernels.cu
+        src/fpi/fpi_cuda_kernels.h
+        src/fpi/fpi_cuda_runtime.cc
     )
 endif()
 add_library(pymdp_ffi SHARED ${_pymdp_ffi_sources})
+target_include_directories(pymdp_ffi PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 # Belt-and-suspenders: even for Release, force -O3 + target-native codegen so
 # the NEON intrinsics in kernel_primitives.h are fully inlined. Scoped to this
 # target (not add_compile_options) so -ffast-math doesn't leak into a parent
