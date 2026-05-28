@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Sequence
 
 import jax
@@ -104,44 +105,150 @@ def _register_all_efe_targets_eager() -> None:
     )
 
 
-# CUDA dispatch overhead amortization threshold. The neg-EFE kernel runs as a
-# multi-stage pipeline (factor scoring + per-modality scoring + scatter); each
-# stage launches at least one device kernel. On Maxwell sm_53 the per-launch
-# latency totals ~1ms across the pipeline, so problems below ~10K work units
-# (P * T * sum(S_f), the per-batch-element work proxy) regress vs the JAX
-# fallback. Measured: agent_step (24*1*18 = 432) was +22% over JAX baseline,
-# while the inductive fixtures (~93K) clear it by 200x. Override with the
-# PYMDP_FFI_CUDA_MIN_WORK env var; set to 0 to disable the gate.
-_CUDA_MIN_WORK_DEFAULT = 10000
+@dataclass(frozen=True)
+class RooflineParams:
+    """Effective device constants for the neg-EFE CUDA routing model.
+
+    All values are *effective* (sustained, not peak), measured on Orin (Ampere
+    sm_87). Throughputs are flop/ms, bandwidths byte/ms, latencies ms. They are
+    deliberately coarse: the routing decision is a comparison of two times, so
+    it is robust to ~2x error in any single constant. Recalibrate per arch by
+    editing `_ORIN_ROOFLINE` (or pass a `RooflineParams` to the model fn).
+    """
+
+    f_gpu: float          # CUDA-kernel f32 throughput (cuBLAS-staged contractions)
+    bw_gpu: float         # CUDA-path device bandwidth
+    launch_base_ms: float       # fixed CUDA dispatch + scatter overhead
+    launch_per_stage_ms: float  # added latency per (modality | factor) stage
+    f_xla: float          # fused-vmap throughput (XLA's generic fusion)
+    bw_xla: float         # fused-vmap bandwidth
+    fixed_xla_ms: float         # fused-vmap fixed dispatch
 
 
-def _cuda_min_work() -> int:
-    raw = os.environ.get("PYMDP_FFI_CUDA_MIN_WORK", "").strip()
-    if not raw:
-        return _CUDA_MIN_WORK_DEFAULT
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return _CUDA_MIN_WORK_DEFAULT
+# Fit to an Orin bench sweep: the inductive winner (1.29e9 flop, M+F=6) lands at
+# t_cuda~1.66 / t_jax~4.4 ms, the dense crossover at P~1-2k, and the many-factor
+# regime (M+F up to 112) stays launch-bound. f_gpu>f_xla because the hand-tuned
+# cuBLAS-staged kernel out-throughputs XLA's generic fusion on dense
+# contractions; that win is what the per-stage launch term has to amortize.
+_ORIN_ROOFLINE = RooflineParams(
+    f_gpu=1.3e9,
+    bw_gpu=1.0e8,
+    launch_base_ms=0.5,
+    launch_per_stage_ms=0.03,
+    f_xla=3.4e8,
+    bw_xla=1.0e8,
+    fixed_xla_ms=0.6,
+)
+
+
+def neg_efe_ffi_beneficial(
+    policy_matrix,
+    qs_init: Sequence[jax.Array],
+    A: Sequence[jax.Array],
+    A_dependencies: Sequence[Sequence[int]],
+    B_dependencies: Sequence[Sequence[int]],
+    *,
+    params: RooflineParams = _ORIN_ROOFLINE,
+) -> bool | None:
+    """Predict whether the CUDA kernel beats the fused JAX vmap for this shape.
+
+    Routes by comparing two modelled wall times rather than thresholding one
+    work scalar. The multi-stage kernel issues a launch per modality (A-scoring)
+    and per factor (B-rollout) plus a fixed scatter; the fused vmap issues one.
+    Each side's compute is a roofline — ``max(flops / throughput, bytes /
+    bandwidth)`` — so the memory arm guards the low-arithmetic-intensity regime
+    and the compute arm the dense one::
+
+        t_cuda = launch_base + launch_per_stage*(M+F) + max(flops/f_gpu, bytes/bw_gpu)
+        t_jax  = fixed_xla                            + max(flops/f_xla, bytes/bw_xla)
+
+    Returns ``t_cuda < t_jax``, or ``None`` for degenerate shapes (caller then
+    leaves the routing decision unconstrained). All inputs are static shapes,
+    read via ``np.shape`` — no host<->device copy.
+
+    Modelling choices: A[m] / B[f,u] are model params reused across the P
+    policies, so their read volume is counted once; only the per-policy
+    marginals/outputs (O_m, S_f) stream P*T times. The contraction volume per
+    dependency group is a *product* over its parents — fan-out scales cost
+    multiplicatively, which a per-factor sum does not capture.
+    """
+    pm_shape = np.shape(policy_matrix)
+    if len(pm_shape) < 2 or not qs_init:
+        return None
+    P, T = int(pm_shape[0]), int(pm_shape[1])
+    if P <= 0 or T <= 0:
+        return None
+    S = [int(np.shape(q)[0]) for q in qs_init]
+    M, F = len(A_dependencies), len(B_dependencies)
+    if M < 1 or F < 1:
+        return None
+
+    a_vol = 0          # sum_m O_m * prod S over A-deps  (A read volume / step)
+    out_a = 0          # sum_m O_m                       (qo marginals / step)
+    for m, deps in enumerate(A_dependencies):
+        O_m = int(np.shape(A[m])[0])
+        out_a += O_m
+        vol = O_m
+        for d in deps:
+            vol *= S[d]
+        a_vol += vol
+
+    b_vol = 0          # sum_f S_f * prod S over B-deps  (B read volume / step)
+    for f, deps in enumerate(B_dependencies):
+        vol = S[f]
+        for d in deps:
+            vol *= S[d]
+        b_vol += vol
+
+    DT = 4  # f32 modelling width
+    contraction = a_vol + b_vol
+    flops = 2.0 * P * T * contraction
+    # params (A, B) read once + per-policy marginals (O_m) and updated states (S_f)
+    stream_elems = out_a + sum(S)
+    bytes_moved = DT * (contraction + P * T * stream_elems)
+
+    p = params
+    t_cuda = (
+        p.launch_base_ms
+        + p.launch_per_stage_ms * (M + F)
+        + max(flops / p.f_gpu, bytes_moved / p.bw_gpu)
+    )
+    t_jax = p.fixed_xla_ms + max(flops / p.f_xla, bytes_moved / p.bw_xla)
+    return t_cuda < t_jax
+
+
+def _cuda_routing_override() -> bool | None:
+    """Manual bypass of the roofline routing model via ``PYMDP_FFI_CUDA_FORCE``.
+
+    Returns True to force the CUDA target, False to force the fallback, or None
+    to defer to the cost model.
+    """
+    force = os.environ.get("PYMDP_FFI_CUDA_FORCE", "").strip().lower()
+    if force in ("1", "true", "yes"):
+        return True
+    if force in ("0", "false", "no"):
+        return False
+    return None
 
 
 def _use_cuda_target(
     B_dependencies: Sequence[Sequence[int]],
     *,
-    work_proxy: int | None = None,
+    ffi_beneficial: bool | None = None,
 ) -> bool:
     """Predicate: should the CUDA FFI target be used over the CPU one?
 
-    True when all three hold:
+    True when all hold:
       * `PYMDP_FFI_USE_CUDA` env var is set to a truthy value (opt-in),
       * the loaded lib was built with CUDA support (`ffi_capabilities()["cuda"]`),
-      * every factor's B_dependencies rank is within the kernel's parent-rank cap.
+      * every factor's B_dependencies rank is within the kernel's parent-rank cap,
+      * the roofline model predicts CUDA is faster (``ffi_beneficial`` is not
+        False), unless overridden via `PYMDP_FFI_CUDA_FORCE`.
 
-    When ``work_proxy`` (P * T * sum(S_f) per batch element) is provided and
-    falls below ``PYMDP_FFI_CUDA_MIN_WORK``, the CUDA target is declined so the
-    caller falls through — to CPU FFI on a CPU-backend host (CPU targets
-    register with platform="cpu" and are reachable), or to the JAX vmap on a
-    CUDA-backend host (CPU targets are invisible to the CUDA jit there).
+    When the model declines, the caller falls through — to CPU FFI on a
+    CPU-backend host (CPU targets register with platform="cpu" and are
+    reachable), or to the JAX vmap on a CUDA-backend host (CPU targets are
+    invisible to the CUDA jit there).
     """
     flag = os.environ.get("PYMDP_FFI_USE_CUDA", "").strip().lower()
     if flag in ("", "0", "false", "no"):
@@ -150,7 +257,10 @@ def _use_cuda_target(
         return False
     if not all(dep_list_rank_ok(d) for d in B_dependencies):
         return False
-    if work_proxy is not None and work_proxy < _cuda_min_work():
+    override = _cuda_routing_override()
+    if override is not None:
+        return override
+    if ffi_beneficial is False:
         return False
     return True
 
@@ -162,7 +272,7 @@ def can_handle(
     *,
     num_factors: int | None = None,
     num_modalities: int | None = None,
-    work_proxy: int | None = None,
+    ffi_beneficial: bool | None = None,
 ) -> bool:
     """Fast predicate: can the FFI kernel handle this problem?
 
@@ -182,18 +292,20 @@ def can_handle(
     the pA/pB novelty (Dirichlet information-gain) terms via precomputed wA /
     wB weights derived from the spm_wnorm formula.
 
-    Note on work_proxy: callers on a CUDA-backend host can pass the per-batch
-    work proxy (P * T * sum(S_f)); when below ``PYMDP_FFI_CUDA_MIN_WORK`` the
-    gate declines so the JAX vmap handles the call (CPU FFI is invisible to the
-    CUDA jit). Omitting work_proxy preserves prior behavior (FFI always wins on
-    CPU-backend hosts).
+    Note on ffi_beneficial: callers on a CUDA-backend host can pass the
+    roofline routing decision (see ``neg_efe_ffi_beneficial``); when it is
+    False the gate declines so the JAX vmap handles the call (CPU FFI is
+    invisible to the CUDA jit). Omitting it preserves prior behavior (FFI
+    always wins on CPU-backend hosts).
     """
     if not is_available():
         return False
     # CPU FFI targets are registered with platform="cpu" and are invisible to
     # the CUDA JIT.  On a CUDA-backend host, only allow dispatch when the CUDA
     # kernel path is actually selected; otherwise JAX handles the call.
-    if has_jax_cuda_backend() and not _use_cuda_target(B_dependencies, work_proxy=work_proxy):
+    if has_jax_cuda_backend() and not _use_cuda_target(
+        B_dependencies, ffi_beneficial=ffi_beneficial
+    ):
         return False
     if num_modalities is not None and len(A_dependencies) != num_modalities:
         return False
@@ -227,7 +339,7 @@ def _validate_efe_inputs(
     use_inductive: bool,
     use_param_info_gain: bool,
     inductive_epsilon: float,
-    work_proxy: int | None = None,
+    ffi_beneficial: bool | None = None,
 ) -> None:
     F = len(qs_init)
     M = len(A)
@@ -237,18 +349,18 @@ def _validate_efe_inputs(
         raise ValueError("B and I must have one entry per hidden-state factor")
     if len(C) != M:
         raise ValueError("C must have one entry per observation modality")
-    # work_proxy is threaded in so the gate's decision matches the dispatch
-    # path below: _use_cuda_target consults work_proxy to skip small
-    # workloads on CUDA-backend hosts (CPU FFI targets are invisible to the
-    # CUDA jit), and can_handle must use the same input or the validator
-    # accepts calls that later fail at FFI lookup time.
+    # ffi_beneficial is threaded in so the gate's decision matches the
+    # dispatch path below: _use_cuda_target consults it to skip CUDA on shapes
+    # the roofline model predicts are launch-bound (CPU FFI targets are
+    # invisible to the CUDA jit), and can_handle must use the same input or the
+    # validator accepts calls that later fail at FFI lookup time.
     if not can_handle(
         A_dependencies,
         B_dependencies,
         use_param_info_gain=use_param_info_gain,
         num_factors=F,
         num_modalities=M,
-        work_proxy=work_proxy,
+        ffi_beneficial=ffi_beneficial,
     ):
         raise ValueError("unsupported or inconsistent A/B dependency metadata")
 
@@ -369,19 +481,14 @@ def neg_efe_all_policies_ffi(
     # JIT compiles in the device-pointer path on CUDA and the host-buffer
     # path on CPU. On Jetson Nano (CPU-only jaxlib), has_jax_cuda_backend()
     # is False and only the host-buffer target is registered.
-    # Compute work proxy from concrete shapes so the CUDA gate matches the
-    # decision can_handle made upstream. P * T * sum(S_f) is the per-batch
-    # work, ignoring batch_size (vmap_method="broadcast_all" handles that
-    # internally and dispatch overhead is the same per call).
-    pm_shape = np.shape(policy_matrix)
-    if len(pm_shape) >= 2:
-        _wp_P = int(pm_shape[0])
-        _wp_T = int(pm_shape[1])
-        _wp_S = sum(int(np.shape(q)[0]) for q in qs_init) if qs_init else 0
-        _work_proxy: int | None = _wp_P * _wp_T * _wp_S
-    else:
-        _work_proxy = None
-    use_cuda = _use_cuda_target(B_dependencies, work_proxy=_work_proxy)
+    # Run the roofline routing model on concrete shapes so the CUDA gate here
+    # matches the decision can_handle made upstream (batch_size is ignored;
+    # vmap_method="broadcast_all" handles it internally and per-call dispatch
+    # overhead is the same).
+    _cuda_ok = neg_efe_ffi_beneficial(
+        policy_matrix, qs_init, A, A_dependencies, B_dependencies
+    )
+    use_cuda = _use_cuda_target(B_dependencies, ffi_beneficial=_cuda_ok)
     use_cuda_dev = use_cuda and has_jax_cuda_backend()
 
     if use_cuda:
@@ -420,7 +527,7 @@ def neg_efe_all_policies_ffi(
         use_inductive=use_inductive,
         use_param_info_gain=use_param_info_gain,
         inductive_epsilon=inductive_epsilon,
-        work_proxy=_work_proxy,
+        ffi_beneficial=_cuda_ok,
     )
 
     # C is broadcast to the kernel's `(T, O_m)` ABI; shape attrs are int64.

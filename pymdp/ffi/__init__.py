@@ -78,7 +78,13 @@ def _install_xla_autotune_off() -> None:
 _install_xla_autotune_off()
 
 
-from ._core import cpu_capabilities, ffi_capabilities, is_available, load_error, with_jax_grad
+from ._core import (
+    cpu_capabilities,
+    ffi_capabilities,
+    is_available,
+    load_error,
+    with_jax_grad,
+)
 from ._efe import (
     FLAG_USE_INDUCTIVE,
     FLAG_USE_PARAM_INFO_GAIN,
@@ -87,6 +93,7 @@ from ._efe import (
     _register_all_efe_targets_eager,
     can_handle,
     neg_efe_all_policies_ffi,
+    neg_efe_ffi_beneficial,
 )
 from ._fpi import _register_all_fpi_targets_eager, can_handle_fpi, fpi_ffi
 
@@ -147,5 +154,6 @@ __all__ = [
     "is_available",
     "load_error",
     "neg_efe_all_policies_ffi",
+    "neg_efe_ffi_beneficial",
     "with_jax_grad",
 ]
