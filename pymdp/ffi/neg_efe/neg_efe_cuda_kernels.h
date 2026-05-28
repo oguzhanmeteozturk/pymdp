@@ -166,5 +166,23 @@ cudaError_t launch_modality_score_dedup_rank3_fused_tiny(const float* A_unflat, 
                                                          int H_d_2, int S_d_0, int S_d_1, int S_d_2, int64_t b_stride,
                                                          bool use_states, bool use_linear, bool use_pA,
                                                          float* score_out, cudaStream_t stream);
+
+// Content-tag gather. One launch dispatches `n_jobs` blocks (1 block per
+// buffer, one warp each); each block writes 24 contiguous 32-bit words into
+// its `dst` slot, sampled per content_tag()'s positions (16-prefix +
+// 8-stride). Caller syncs the stream and hashes each slot via
+// content_tag_from_samples() in common/cache_lru.h. Works for both float and
+// int32 src buffers (raw bit-copy); job sizes count 4-byte words. `dst_stride`
+// counts 32-bit words per slot (= kContentTagTotalSamples). Jobs with
+// src == nullptr or size <= 0 zero their slot. `kContentTagBatchMax` caps
+// `n_jobs` so the (src, size) arrays fit in kernel-arg space.
+constexpr int kContentTagBatchMax = 8;
+struct ContentTagBatchJobs {
+  const void* src[kContentTagBatchMax];
+  int64_t     size[kContentTagBatchMax];
+};
+cudaError_t launch_content_tag_gather_batch(const ContentTagBatchJobs& jobs, int n_jobs, void* dst, int dst_stride,
+                                            cudaStream_t stream);
+
 }  // namespace cuda_kernels
 }  // namespace pymdp_ffi

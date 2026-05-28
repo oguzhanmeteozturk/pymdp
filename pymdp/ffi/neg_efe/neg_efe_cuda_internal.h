@@ -90,10 +90,12 @@ inline uint64_t cuda_linear_sig(const Layout& L, int Bn) {
 // =============================================================================
 
 // cache.cc — prepare_caches drives the per-cache fills in dependency order
-// (tree, A, B, wA/wB if param_info_gain, linear).
+// (tree, A, B, wA/wB if param_info_gain, linear). Each fill keys on the
+// host-computed content_tag, so the cold path is correct regardless of
+// device-pointer reuse; the warm-path content check lives in entry.cc.
 FfiError prepare_caches(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const int32_t* pm_base,
                         const float* A_base, const float* B_base, const float* C_base, const float* pA_base,
-                        const float* pB_base, bool pA_present, bool pB_present, DevSrcs srcs = {});
+                        const float* pB_base, bool pA_present, bool pB_present);
 
 // runtime.cc — scratch sizing, qs / inductive upload, full forward pass driver,
 // optional timing log.

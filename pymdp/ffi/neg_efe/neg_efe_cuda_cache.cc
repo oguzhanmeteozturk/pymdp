@@ -1,7 +1,10 @@
 // Cache materialization for the CUDA neg-EFE forward pass. Each per-cache
-// fill helper is keyed on (content tag, layout sig, devptr identity) and
-// short-circuits on a match; on miss it stages host packing into a CuPool
-// and stores the resulting CuArrs in NegEfeContext.
+// fill helper is keyed on (content tag, layout sig) and short-circuits on a
+// match; on miss it stages host packing into a CuPool and stores the
+// resulting CuArrs in NegEfeContext. The content tag is a sampled fingerprint
+// of the host buffer, so reuse of a device address for mutated data is
+// detected here on the cold path and by caches_are_warm (entry.cc) on the
+// warm path.
 
 #include "neg_efe/neg_efe.h"
 
@@ -215,8 +218,7 @@ inline bool pm_is_broadcast(const int32_t* pm_base, int Bn, int P, int T, int F)
 // Tree cache: per-(t, f) factor-history dedup + dependent index tables
 // (mod_offs, ind_offs, mod_h_dims, pmi, p2h_concat, scratch sizings).
 // Broadcast precondition (pm equal across batch) is enforced on miss.
-FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int32_t* pm_base,
-                         const void* pm_dev_src = nullptr) {
+FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int32_t* pm_base) {
   const int      P              = static_cast<int>(L.P);
   const int      T              = static_cast<int>(L.T);
   const int      F              = static_cast<int>(L.F);
@@ -224,7 +226,7 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
   const uint64_t pm_tag         = content_tag(reinterpret_cast<const float*>(pm_base), pm_size_floats);
   const uint64_t pm_sig         = factor_history_pm_sig(L);
 
-  if (ctx.tree_cache.match_and_touch(pm_tag, pm_size_floats, pm_sig, pm_dev_src)) return FfiError::Success();
+  if (ctx.tree_cache.match(pm_tag, pm_size_floats, pm_sig)) return FfiError::Success();
 
   if (!pm_is_broadcast(pm_base, Bn, P, T, F)) {
     return invalid_arg(kEfeKernelName, "CUDA path requires broadcast policy_matrix across batch");
@@ -253,7 +255,7 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
 
   FactorMetaPack meta = pack_factor_metadata(L, F, &pool);
 
-  ctx.tree_cache.key.set(pm_tag, pm_size_floats, pm_sig, pm_dev_src);
+  ctx.tree_cache.key.set(pm_tag, pm_size_floats, pm_sig);
   ctx.tree_cache.pool                         = std::move(pool);
   ctx.tree_cache.factor_tree                  = std::move(ftree);
   ctx.tree_cache.factor_parent_history        = std::move(parent_views);
@@ -281,43 +283,40 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
 
 // A cache: per-modality [Bn, O_m, K_m] + cuBLAS-permuted view for rank-3.
 // Returns A_tag for the downstream linear-cache key.
-FfiError fill_a_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* A_base, uint64_t* A_tag_out,
-                      const void* A_dev_src = nullptr) {
+FfiError fill_a_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* A_base, uint64_t* A_tag_out) {
   const int64_t  A_total_size = static_cast<int64_t>(Bn) * L.A_off[L.M];
   const uint64_t A_tag        = content_tag(A_base, A_total_size);
   const uint64_t A_sig        = a_sig_bn(L, Bn);
   *A_tag_out                  = A_tag;
 
-  if (ctx.a_cache.match_and_touch(A_tag, A_total_size, A_sig, A_dev_src)) return FfiError::Success();
+  if (ctx.a_cache.match(A_tag, A_total_size, A_sig)) return FfiError::Success();
 
   CuPool pool;
   CUDA_TRY("a_pool_reserve", pool.reserve(a_pack_pool_bytes(L, Bn)));
   CuArrVec arrays, cublas_views;
   pack_a_modalities(L, Bn, A_base, &pool, &arrays, &cublas_views, &g_cuda_host_pack_scratch,
                     &g_cuda_host_pack_scratch_alt);
-  ctx.a_cache.store(A_tag, A_total_size, A_sig, std::move(pool), std::move(arrays), std::move(cublas_views), A_dev_src);
+  ctx.a_cache.store(A_tag, A_total_size, A_sig, std::move(pool), std::move(arrays), std::move(cublas_views));
   return FfiError::Success();
 }
 
 // B cache: per-factor [Bn, S_f, K_f, U_f]; K_f = product of B-dep state sizes.
-FfiError fill_b_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* B_base,
-                      const void* B_dev_src = nullptr) {
+FfiError fill_b_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* B_base) {
   const int64_t  B_total_size = static_cast<int64_t>(Bn) * L.B_off[L.F];
   const uint64_t B_tag        = content_tag(B_base, B_total_size);
   const uint64_t B_sig        = b_sig_bn(L, Bn);
 
-  if (ctx.b_cache.match_and_touch(B_tag, B_total_size, B_sig, B_dev_src)) return FfiError::Success();
+  if (ctx.b_cache.match(B_tag, B_total_size, B_sig)) return FfiError::Success();
 
   CuPool pool;
   CUDA_TRY("b_pool_reserve", pool.reserve(b_pack_pool_bytes(L, Bn)));
   CuArrVec arrays;
   pack_b_factors(L, Bn, B_base, &pool, &arrays, &g_cuda_host_pack_scratch);
-  ctx.b_cache.store(B_tag, B_total_size, B_sig, std::move(pool), std::move(arrays), B_dev_src);
+  ctx.b_cache.store(B_tag, B_total_size, B_sig, std::move(pool), std::move(arrays));
   return FfiError::Success();
 }
 
-FfiError fill_wa_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* pA_base, bool pA_present,
-                       const void* pA_dev_src = nullptr) {
+FfiError fill_wa_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* pA_base, bool pA_present) {
   if (!pA_present) {
     ctx.wa_cache.clear();
     return FfiError::Success();
@@ -325,7 +324,7 @@ FfiError fill_wa_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
   const int64_t  A_total_size = static_cast<int64_t>(Bn) * L.A_off[L.M];
   const uint64_t pA_tag       = content_tag(pA_base, A_total_size);
   const uint64_t pA_sig       = a_sig_bn(L, Bn);
-  if (ctx.wa_cache.match_and_touch(pA_tag, A_total_size, pA_sig, pA_dev_src)) return FfiError::Success();
+  if (ctx.wa_cache.match(pA_tag, A_total_size, pA_sig)) return FfiError::Success();
 
   CuPool pool;
   CUDA_TRY("wa_pool_reserve", pool.reserve(a_pack_pool_bytes(L, Bn)));
@@ -344,13 +343,11 @@ FfiError fill_wa_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
   CuArrVec           arrays, cublas_views;
   std::vector<float> cublas_scratch;
   pack_a_modalities(L, Bn, all_wA.data(), &pool, &arrays, &cublas_views, &g_cuda_host_pack_scratch, &cublas_scratch);
-  ctx.wa_cache.store(pA_tag, A_total_size, pA_sig, std::move(pool), std::move(arrays), std::move(cublas_views),
-                     pA_dev_src);
+  ctx.wa_cache.store(pA_tag, A_total_size, pA_sig, std::move(pool), std::move(arrays), std::move(cublas_views));
   return FfiError::Success();
 }
 
-FfiError fill_wb_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* pB_base, bool pB_present,
-                       const void* pB_dev_src = nullptr) {
+FfiError fill_wb_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* pB_base, bool pB_present) {
   if (!pB_present) {
     ctx.wb_cache.clear();
     return FfiError::Success();
@@ -358,7 +355,7 @@ FfiError fill_wb_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
   const int64_t  B_total_size = static_cast<int64_t>(Bn) * L.B_off[L.F];
   const uint64_t pB_tag       = content_tag(pB_base, B_total_size);
   const uint64_t pB_sig       = b_sig_bn(L, Bn);
-  if (ctx.wb_cache.match_and_touch(pB_tag, B_total_size, pB_sig, pB_dev_src)) return FfiError::Success();
+  if (ctx.wb_cache.match(pB_tag, B_total_size, pB_sig)) return FfiError::Success();
 
   CuPool pool;
   CUDA_TRY("wb_pool_reserve", pool.reserve(b_pack_pool_bytes(L, Bn)));
@@ -375,7 +372,7 @@ FfiError fill_wb_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
 
   CuArrVec arrays;
   pack_b_factors(L, Bn, all_wB.data(), &pool, &arrays, &g_cuda_host_pack_scratch);
-  ctx.wb_cache.store(pB_tag, B_total_size, pB_sig, std::move(pool), std::move(arrays), pB_dev_src);
+  ctx.wb_cache.store(pB_tag, B_total_size, pB_sig, std::move(pool), std::move(arrays));
   return FfiError::Success();
 }
 
@@ -424,20 +421,18 @@ void build_linear_tm_slice(const Layout& L, int Bn, int t, int m, KernelFlags fl
 // Linear cache: per-(t, m) [Bn, K_m] tensor fusing the HA entropy term and
 // the A^T C utility term. Key uses only the two flags that shape `linear`.
 FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const float* A_base,
-                           const float* C_base, uint64_t A_tag, const void* A_dev_src = nullptr,
-                           const void* C_dev_src = nullptr) {
-  const int      T             = static_cast<int>(L.T);
-  const int      M             = static_cast<int>(L.M);
-  const int64_t  C_total_size  = static_cast<int64_t>(Bn) * L.C_off[L.M];
-  const uint64_t C_tag         = flags.use_utility ? content_tag(C_base, C_total_size) : 0;
-  const uint64_t linear_sig    = cuda_linear_sig(L, Bn);
-  const int32_t  flag_bits     = (flags.use_states_info_gain ? 1 : 0) | (flags.use_utility ? 2 : 0);
-  const void*    c_dev_for_key = flags.use_utility ? C_dev_src : nullptr;
-  if (ctx.linear_cache.match_and_touch(A_tag, C_tag, linear_sig, flag_bits, A_dev_src, c_dev_for_key)) {
+                           const float* C_base, uint64_t A_tag) {
+  const int      T            = static_cast<int>(L.T);
+  const int      M            = static_cast<int>(L.M);
+  const int64_t  C_total_size = static_cast<int64_t>(Bn) * L.C_off[L.M];
+  const uint64_t C_tag        = flags.use_utility ? content_tag(C_base, C_total_size) : 0;
+  const uint64_t linear_sig   = cuda_linear_sig(L, Bn);
+  const int32_t  flag_bits    = (flags.use_states_info_gain ? 1 : 0) | (flags.use_utility ? 2 : 0);
+  if (ctx.linear_cache.match(A_tag, C_tag, linear_sig, flag_bits)) {
     return FfiError::Success();
   }
   if (flag_bits == 0) {
-    ctx.linear_cache.store_empty(A_tag, C_tag, linear_sig, flag_bits, A_dev_src, c_dev_for_key);
+    ctx.linear_cache.store_empty(A_tag, C_tag, linear_sig, flag_bits);
     return FfiError::Success();
   }
 
@@ -460,15 +455,13 @@ FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flag
     }
   }
 
-  ctx.linear_cache.a_tag         = A_tag;
-  ctx.linear_cache.c_tag         = C_tag;
-  ctx.linear_cache.layout_sig    = linear_sig;
-  ctx.linear_cache.flags         = flag_bits;
-  ctx.linear_cache.valid         = true;
-  ctx.linear_cache.last_a_devptr = A_dev_src;
-  ctx.linear_cache.last_c_devptr = c_dev_for_key;
-  ctx.linear_cache.pool          = std::move(pool);
-  ctx.linear_cache.per_tm        = std::move(per_tm);
+  ctx.linear_cache.a_tag      = A_tag;
+  ctx.linear_cache.c_tag      = C_tag;
+  ctx.linear_cache.layout_sig = linear_sig;
+  ctx.linear_cache.flags      = flag_bits;
+  ctx.linear_cache.valid      = true;
+  ctx.linear_cache.pool       = std::move(pool);
+  ctx.linear_cache.per_tm     = std::move(per_tm);
   return FfiError::Success();
 }
 
@@ -476,19 +469,19 @@ FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flag
 
 FfiError prepare_caches(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const int32_t* pm_base,
                         const float* A_base, const float* B_base, const float* C_base, const float* pA_base,
-                        const float* pB_base, bool pA_present, bool pB_present, DevSrcs srcs) {
-  PYMDP_TRY(fill_tree_cache(ctx, L, Bn, pm_base, srcs.pm));
+                        const float* pB_base, bool pA_present, bool pB_present) {
+  PYMDP_TRY(fill_tree_cache(ctx, L, Bn, pm_base));
   uint64_t A_tag = 0;
-  PYMDP_TRY(fill_a_cache(ctx, L, Bn, A_base, &A_tag, srcs.A));
-  PYMDP_TRY(fill_b_cache(ctx, L, Bn, B_base, srcs.B));
+  PYMDP_TRY(fill_a_cache(ctx, L, Bn, A_base, &A_tag));
+  PYMDP_TRY(fill_b_cache(ctx, L, Bn, B_base));
   if (flags.use_param_info_gain) {
-    PYMDP_TRY(fill_wa_cache(ctx, L, Bn, pA_base, pA_present, srcs.pA));
-    PYMDP_TRY(fill_wb_cache(ctx, L, Bn, pB_base, pB_present, srcs.pB));
+    PYMDP_TRY(fill_wa_cache(ctx, L, Bn, pA_base, pA_present));
+    PYMDP_TRY(fill_wb_cache(ctx, L, Bn, pB_base, pB_present));
   } else {
     ctx.wa_cache.clear();
     ctx.wb_cache.clear();
   }
-  PYMDP_TRY(fill_linear_cache(ctx, L, flags, Bn, A_base, C_base, A_tag, srcs.A, srcs.C));
+  PYMDP_TRY(fill_linear_cache(ctx, L, flags, Bn, A_base, C_base, A_tag));
   return FfiError::Success();
 }
 

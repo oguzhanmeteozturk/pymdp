@@ -19,6 +19,7 @@
 #include <cstring>
 #include <utility>
 
+#include "common/content_tag_index.h"  // kContentTag* dims + content_tag_stride_index
 #include "common/fnv1a.h"
 
 namespace pymdp_ffi {
@@ -39,8 +40,34 @@ struct CacheKey {
 // between batch elements, while keeping the cache tiny.
 inline constexpr std::size_t kPrecomputeCacheSlots = 8;
 
-// Content-tag sample count: short prefix + 8 strided samples.
-inline constexpr int kContentTagSamples = 8;
+// The content-tag sampling layout (kContentTag* dims + content_tag_stride_index)
+// lives in common/content_tag_index.h so the CUDA gather kernel can share one
+// definition. Backwards-compat alias: pre-refactor callers referred to the 8
+// strided samples as "the content-tag samples".
+inline constexpr int kContentTagSamples = kContentTagStrideSamples;
+
+// Hash a fixed-size buffer of kContentTagTotalSamples values gathered per the
+// sampling layout above. Used by both the host content_tag (gather + hash in
+// one pass) and the CUDA warm-check path (device gather + sync + hash). Reads
+// `min(size, kContentTagPrefixMax)` prefix slots followed by the 8 stride
+// slots, mirroring content_tag()'s mix order so the resulting tag is the
+// same regardless of which path gathered the samples.
+inline uint64_t content_tag_from_samples(const float* samples, int64_t size) {
+  if (size <= 0) return 0;
+  uint64_t      h      = kFnvOffsetBasis;
+  const int64_t prefix = std::min<int64_t>(size, kContentTagPrefixMax);
+  for (int64_t i = 0; i < prefix; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, samples + i, sizeof(bits));
+    h = fnv1a64_mix(h, static_cast<uint64_t>(bits));
+  }
+  for (int i = 0; i < kContentTagStrideSamples; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, samples + kContentTagPrefixMax + i, sizeof(bits));
+    h = fnv1a64_mix(h, static_cast<uint64_t>(bits));
+  }
+  return h;
+}
 
 // Low-cost content fingerprint for cache invalidation. It mixes a short
 // prefix plus strided samples, which catches common buffer reuse /
@@ -60,24 +87,17 @@ inline uint64_t content_tag(const float* data, int64_t size) {
   // buffer with its declared size would segfault inside the std::memcpy
   // below. Treat null + positive-size identically to size <= 0.
   if (data == nullptr) return 0;
-  uint64_t      h      = kFnvOffsetBasis;
-  const int64_t prefix = std::min<int64_t>(size, 16);
-  for (int64_t idx = 0; idx < prefix; ++idx) {
-    uint32_t bits;
-    std::memcpy(&bits, data + idx, sizeof(bits));
-    h = fnv1a64_mix(h, static_cast<uint64_t>(bits));
+  // Raw-bit copies (not float assignment): the CUDA warm-check gathers these
+  // same positions as raw 32-bit words, so a float load/store here — which
+  // could canonicalize an sNaN bit pattern under -ffast-math — would make the
+  // host tag disagree with the device tag for int-reinterpreted buffers (pm).
+  float         samples[kContentTagTotalSamples] = {};
+  const int64_t prefix                           = std::min<int64_t>(size, kContentTagPrefixMax);
+  for (int64_t i = 0; i < prefix; ++i) std::memcpy(&samples[i], &data[i], sizeof(float));
+  for (int i = 0; i < kContentTagStrideSamples; ++i) {
+    std::memcpy(&samples[kContentTagPrefixMax + i], &data[content_tag_stride_index(i, size)], sizeof(float));
   }
-  const int64_t samples[kContentTagSamples] = {
-      0, (size > 1) ? 1 : 0, size / 8, size / 4, size / 2, (size * 3) / 4, (size * 7) / 8, size - 1,
-  };
-  for (long long idx : samples) {
-    if (idx < 0) idx = 0;
-    if (idx >= size) idx = size - 1;
-    uint32_t bits;
-    std::memcpy(&bits, data + idx, sizeof(bits));
-    h = fnv1a64_mix(h, static_cast<uint64_t>(bits));
-  }
-  return h;
+  return content_tag_from_samples(samples, size);
 }
 
 // Refresh the LRU cache and return slot 0. On miss, `recompute` receives the

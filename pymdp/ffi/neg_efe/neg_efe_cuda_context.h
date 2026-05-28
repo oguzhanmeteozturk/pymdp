@@ -25,25 +25,23 @@ using CuArrVec    = std::vector<CuArr>;
 using CuArrGrid2D = std::vector<CuArrVec>;
 
 struct CudaCacheKey {
-  uint64_t    content_tag = 0;
-  uint64_t    layout_sig  = 0;
-  int64_t     size        = 0;
-  const void* last_devptr = nullptr;
+  uint64_t content_tag = 0;
+  uint64_t layout_sig  = 0;
+  int64_t  size        = 0;
 
   bool match(uint64_t tag, int64_t sz, uint64_t sig) const {
     return content_tag == tag && size == sz && layout_sig == sig;
   }
-  bool match_devptr(const void* dev, int64_t sz, uint64_t sig) const {
-    return dev != nullptr && last_devptr == dev && size == sz && layout_sig == sig;
-  }
-  void set(uint64_t tag, int64_t sz, uint64_t sig, const void* dev_src) {
+  void set(uint64_t tag, int64_t sz, uint64_t sig) {
     content_tag = tag;
     size        = sz;
     layout_sig  = sig;
-    last_devptr = dev_src;
   }
 };
 
+// Device source pointers for the current call's model inputs. Consumed by the
+// CUDA-Dev warm check (caches_are_warm) as the gather sources for the content
+// fingerprint. nullptr marks an absent optional buffer (C / pA / pB).
 struct DevSrcs {
   const void* pm = nullptr;
   const void* A  = nullptr;
@@ -59,20 +57,10 @@ struct CudaArrayCache {
   CuArrVec     arrays;
 
   bool match(uint64_t tag, int64_t sz, uint64_t sig) const { return key.match(tag, sz, sig) && !arrays.empty(); }
-  bool match_devptr(const void* dev, int64_t sz, uint64_t sig) const {
-    return key.match_devptr(dev, sz, sig) && !arrays.empty();
-  }
-  // Cache hit + refresh of the stored devptr. Callers use this as a
-  // single-expression early-return in the per-call fill helpers.
-  bool match_and_touch(uint64_t tag, int64_t sz, uint64_t sig, const void* dev_src) {
-    if (!match(tag, sz, sig)) return false;
-    key.last_devptr = dev_src;
-    return true;
-  }
-  void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built, const void* dev_src = nullptr) {
+  void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built) {
     pool   = std::move(built_pool);
     arrays = std::move(built);
-    key.set(tag, sz, sig, dev_src);
+    key.set(tag, sz, sig);
   }
   void clear() {
     pool.reset();
@@ -88,20 +76,11 @@ struct CudaACache {
   CuArrVec     cublas_views;
 
   bool match(uint64_t tag, int64_t sz, uint64_t sig) const { return key.match(tag, sz, sig) && !arrays.empty(); }
-  bool match_devptr(const void* dev, int64_t sz, uint64_t sig) const {
-    return key.match_devptr(dev, sz, sig) && !arrays.empty();
-  }
-  bool match_and_touch(uint64_t tag, int64_t sz, uint64_t sig, const void* dev_src) {
-    if (!match(tag, sz, sig)) return false;
-    key.last_devptr = dev_src;
-    return true;
-  }
-  void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built, CuArrVec built_cublas,
-             const void* dev_src = nullptr) {
+  void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built, CuArrVec built_cublas) {
     pool         = std::move(built_pool);
     arrays       = std::move(built);
     cublas_views = std::move(built_cublas);
-    key.set(tag, sz, sig, dev_src);
+    key.set(tag, sz, sig);
   }
   void clear() {
     pool.reset();
@@ -112,37 +91,23 @@ struct CudaACache {
 };
 
 struct CudaLinearCache {
-  uint64_t    a_tag         = 0;
-  uint64_t    c_tag         = 0;
-  uint64_t    layout_sig    = 0;
-  int32_t     flags         = 0;
-  bool        valid         = false;
-  const void* last_a_devptr = nullptr;
-  const void* last_c_devptr = nullptr;
+  uint64_t    a_tag      = 0;
+  uint64_t    c_tag      = 0;
+  uint64_t    layout_sig = 0;
+  int32_t     flags      = 0;
+  bool        valid      = false;
   CuPool      pool;
   CuArrGrid2D per_tm;
 
   bool match(uint64_t a, uint64_t c, uint64_t sig, int32_t fl) const {
     return valid && a_tag == a && c_tag == c && layout_sig == sig && flags == fl;
   }
-  bool match_devptr(const void* a_dev, const void* c_dev, uint64_t sig, int32_t fl) const {
-    return valid && a_dev != nullptr && last_a_devptr == a_dev && last_c_devptr == c_dev && layout_sig == sig &&
-           flags == fl;
-  }
-  bool match_and_touch(uint64_t a, uint64_t c, uint64_t sig, int32_t fl, const void* a_dev, const void* c_dev) {
-    if (!match(a, c, sig, fl)) return false;
-    last_a_devptr = a_dev;
-    last_c_devptr = c_dev;
-    return true;
-  }
-  void store_empty(uint64_t a, uint64_t c, uint64_t sig, int32_t fl, const void* a_dev, const void* c_dev) {
-    a_tag         = a;
-    c_tag         = c;
-    layout_sig    = sig;
-    flags         = fl;
-    valid         = true;
-    last_a_devptr = a_dev;
-    last_c_devptr = c_dev;
+  void store_empty(uint64_t a, uint64_t c, uint64_t sig, int32_t fl) {
+    a_tag      = a;
+    c_tag      = c;
+    layout_sig = sig;
+    flags      = fl;
+    valid      = true;
     pool.reset();
     per_tm.clear();
   }
@@ -178,14 +143,6 @@ struct FactorHistoryCache {
   int64_t I_per_batch = 0;
 
   bool match(uint64_t tag, int64_t sz, uint64_t sig) const { return key.match(tag, sz, sig) && !factor_tree.empty(); }
-  bool match_devptr(const void* dev, int64_t sz, uint64_t sig) const {
-    return key.match_devptr(dev, sz, sig) && !factor_tree.empty();
-  }
-  bool match_and_touch(uint64_t tag, int64_t sz, uint64_t sig, const void* dev_src) {
-    if (!match(tag, sz, sig)) return false;
-    key.last_devptr = dev_src;
-    return true;
-  }
 };
 
 using CudaTreeCache = FactorHistoryCache;
@@ -204,6 +161,11 @@ struct CudaScratch {
   CuArr    tmp_wa_cublas;
   CuArr    factor_scores;
   CuArr    out_dev;
+  // Content-tag gather scratch for the CUDA-Dev warm check. Managed memory
+  // so the host can read the gathered 32-bit words after one stream sync.
+  // Sized for the 6 fingerprinted buffers (pm, A, B, C, pA, pB) at
+  // kContentTagTotalSamples 4-byte words each = 576 bytes.
+  CuArr    content_tag_dev;
 };
 
 inline thread_local std::vector<float> g_cuda_host_pack_scratch;

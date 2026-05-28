@@ -34,6 +34,8 @@
 
 #include <cstdint>
 
+#include "common/content_tag_index.h"  // content_tag_stride_index, kContentTag* constants
+
 namespace pymdp_ffi {
 namespace cuda_kernels {
 
@@ -1483,6 +1485,61 @@ cudaError_t launch_final_scatter_dedup(const float* scores_concat, const float* 
         ind_off, Bn, T, M, F, P, total_mod, total_ind, out);
     break;
   }
+  return cudaGetLastError();
+}
+
+// -----------------------------------------------------------------------------
+// Content-tag gather kernel
+// -----------------------------------------------------------------------------
+//
+// Sample kContentTagTotalSamples (24) 4-byte words from each fingerprinted
+// device buffer at the same positions content_tag()/content_tag_from_samples()
+// use on the host. Output lands in a managed/host-readable buffer so the
+// CUDA-Dev warm check can recompute the FNV-1a tag from the gathered samples
+// and compare it to the cached host-computed tag — catching in-place A/B
+// mutations (e.g. the agent's learning step) that reuse the same device
+// pointer + shape.
+//
+// One launch dispatches one block (one warp) per buffer; only the first
+// kContentTagTotalSamples of the 32 threads produce output. Sources are read
+// as raw 32-bit words, so the same kernel covers both float A/B/C/pA/pB and
+// int32 policy-matrix buffers. Stride positions come from the shared
+// content_tag_stride_index() in common/content_tag_index.h, so host and device
+// sample identical positions from one definition.
+//
+// Per buffer: prefix slots [0, kContentTagPrefixMax) read src[i] (clamped to
+// size-1 when i >= size — the host hash ignores those slots), stride slots
+// read src[content_tag_stride_index(slot - kContentTagPrefixMax, size)].
+// Absent buffers (src == nullptr or size <= 0) zero their slot.
+__global__ void content_tag_gather_batch_kernel(ContentTagBatchJobs jobs, int n_jobs, uint32_t* __restrict__ dst,
+                                                int dst_stride) {
+  const int b = blockIdx.x;
+  if (b >= n_jobs) return;
+  const int i = threadIdx.x;
+  if (i >= kContentTagTotalSamples) return;
+
+  const uint32_t* src  = reinterpret_cast<const uint32_t*>(jobs.src[b]);
+  const int64_t   size = jobs.size[b];
+  uint32_t*       out  = dst + static_cast<int64_t>(b) * dst_stride;
+
+  if (src == nullptr || size <= 0) {
+    out[i] = 0u;
+    return;
+  }
+  int64_t idx;
+  if (i < kContentTagPrefixMax) {
+    idx = (static_cast<int64_t>(i) < size) ? static_cast<int64_t>(i) : (size - 1);
+  } else {
+    idx = content_tag_stride_index(i - kContentTagPrefixMax, size);
+  }
+  out[i] = src[idx];
+}
+
+cudaError_t launch_content_tag_gather_batch(const ContentTagBatchJobs& jobs, int n_jobs, void* dst, int dst_stride,
+                                            cudaStream_t stream) {
+  if (n_jobs <= 0) return cudaSuccess;
+  if (n_jobs > kContentTagBatchMax) return cudaErrorInvalidValue;
+  content_tag_gather_batch_kernel<<<n_jobs, 32, 0, stream>>>(jobs, n_jobs, reinterpret_cast<uint32_t*>(dst), dst_stride);
   return cudaGetLastError();
 }
 
