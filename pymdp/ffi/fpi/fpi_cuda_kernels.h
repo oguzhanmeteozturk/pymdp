@@ -1,19 +1,14 @@
-// Host-callable launch wrapper for the native-CUDA FPI kernel. Mirror of the
-// neg_efe_cuda_kernels.h split: the .cu TU compiles with nvcc (no XLA FFI
-// headers) and exposes only this thin launcher to the host glue in
-// fpi_cuda_runtime.cc / fpi_cuda_cache.cc.
+// Host-callable launch wrapper for the native-CUDA FPI kernel. The .cu TU
+// compiles with nvcc (no XLA FFI headers) and exposes only this thin launcher
+// to fpi_cuda_runtime.cc / fpi_cuda_cache.cc.
 //
-// Native CUDA FPI runs all `num_iter` fixed-point iterations inside one
-// kernel — no D2H/H2D, no per-iter host roundtrip, no stream sync. It's the
-// structural fix for the FpiCudaHost shim's pipeline break: with the kernel
-// staying on the stream, JAX's surrounding ops on the same stream pipeline
-// naturally instead of stalling at the per-call sync point.
+// All `num_iter` fixed-point iterations run inside one kernel — no D2H/H2D,
+// no per-iter host roundtrip, no stream sync; JAX ops on the same stream
+// pipeline naturally.
 //
-// Current restrictions: every modality's A_dependencies rank must be in
-// [1, 3]. Modalities with K >= 4 fall back to the FpiCudaHost shim or
-// the JAX scan reference (gated in pymdp/ffi/_fpi.py). The K<=3 hot paths
-// cover every production fixture (rollout_loop / rollout_realistic /
-// rollout_learning all use A_dep rank 2 or 3).
+// Restriction: every modality's A_dependencies rank must be in [1, 3].
+// K >= 4 falls back to FpiCudaHost shim or the JAX scan reference
+// (gated in pymdp/ffi/_fpi.py).
 
 #pragma once
 
@@ -37,29 +32,22 @@ struct ModalityDispatchGpu {
   int32_t ll_off;             // ll_offsets[m]
 };
 
-// Single launch covers `batch` batch elements (one block each) and runs
-// `num_iter` fixed-point iterations internally. All buffers are device
-// pointers; caller manages allocation/lifetime. `S`, `lp_offsets`, `mods`
-// are device arrays staged by the host glue once per call.
+// Single launch covers `batch` batch elements (one block each), running
+// `num_iter` iterations internally. All buffers are device pointers; caller
+// manages allocation/lifetime. `S`, `lp_offsets`, `mods` are device arrays
+// staged by the host glue once per call.
 //
-// Convergence early-exit fires when `max |log_q[i] - log_q_prev[i]|` drops
-// below 1e-5f after iter > 0 (matches the CPU kernel's hard-coded tolerance
-// and the parity tolerance in test_fpi_ffi.py). The snapshot copy that
-// feeds the check is folded into the per-iter softmax pass — each warp
-// that softmaxes a factor also writes that factor's log_q slice to
-// log_q_prev while log_q is hot from the softmax load. That removes the
-// standalone snapshot loop + its __syncthreads, leaving only the
-// block_reduce_max as per-iter convergence overhead.
-// `sync_mask` is a bitmask over modalities: bit m == 1 means the kernel must
-// __syncthreads() after running modality m (because modality m+1 writes a
-// factor slice that overlaps with one of modality m's writes — without the
-// barrier the next modality's `log_q[f] += ...` could race against the
-// in-flight writes of modality m). Bit (M-1) is always 0; an unconditional
-// barrier after the modality loop covers the final write before the
-// convergence read / next iter's softmax. Computed on the host in
-// fpi_cuda_cache.cc from A_dependencies. For fixtures where every
-// modality overlaps the next (the typical production rollout), sync_mask =
-// (1u << (M-1)) - 1 and behavior matches the pre-elision design.
+// Convergence early-exit: fires when `max |log_q[i] - log_q_prev[i]| < 1e-5f`
+// after iter > 0 (matches CPU kernel tolerance). The snapshot copy is folded
+// into the per-iter softmax pass — each warp writes log_q_prev while log_q
+// is hot, removing a standalone copy loop and __syncthreads.
+//
+// `sync_mask`: bitmask over modalities; bit m == 1 means __syncthreads()
+// is required after modality m because modality m+1 writes a factor slice
+// that overlaps modality m's writes (without it, `log_q[f] += ...` races
+// in-flight writes). Bit (M-1) is always 0; an unconditional barrier after
+// the modality loop covers the final write. Computed from A_dependencies in
+// fpi_cuda_cache.cc.
 cudaError_t launch_fpi(const float* ll_flat,  // [batch, total_ll]
                        const float* lp_flat,  // [batch, total_S]
                        float*       q_out,    // [batch, total_S]
@@ -70,28 +58,21 @@ cudaError_t launch_fpi(const float* ll_flat,  // [batch, total_ll]
                        uint32_t                   sync_mask,
                        cudaStream_t               stream);
 
-// Diagnostic: launches an empty kernel with the same grid/block/shmem
-// footprint as launch_fpi, no buffer touches and no compute. Used by the
-// PYMDP_FFI_FPI_KERNEL_NOOP env-gated bypass in FpiCudaDevice to bound the
-// XLA-dispatch + cuLaunchKernel + driver-roundtrip overhead share of fpi
-// fixture wall time. Diff vs launch_fpi at the same fpi_large shape =
-// kernel-internal work + nothing else.
+// Diagnostic: empty kernel with the same grid/block/shmem as launch_fpi.
+// Used by PYMDP_FFI_FPI_KERNEL_NOOP in FpiCudaDevice; diff vs launch_fpi
+// isolates kernel-internal work from XLA-dispatch + driver overhead.
 cudaError_t launch_fpi_noop(int batch, int total_S, cudaStream_t stream);
 
 // Small-metadata variant. Carries S, lp_offsets, and the per-modality
-// dispatch table by value as kernel arguments — on sm_70+ these live
-// in the dedicated constant-memory parameter bank, served via
-// LDC (broadcast to all 32 lanes in one cycle) instead of L1-cached LDG
-// against device pointers (10-20 cycles even on hit). Removes the per-
-// call H2D for the dispatch arrays on the cache-miss path AND the
-// per-iteration global loads for `S[f]` / `lp_offsets[f]` / `mods[m]`
-// on the hot path.
+// dispatch table by value as kernel arguments — on sm_70+ these live in
+// the constant-memory parameter bank (LDC, broadcast) instead of L1-cached
+// global loads (LDG). Eliminates the per-call H2D for dispatch arrays on the
+// cache-miss path and the per-iteration global loads for S[f] / lp_offsets[f]
+// / mods[m] on the hot path.
 //
-// Capacity caps (kMaxFSmallMeta / kMaxMSmallMeta = 8 each) match the
-// kernel-arg constant-memory budget on sm_70+ comfortably (FpiSmallMeta
-// is ~320 bytes; current kernel cmem[0] is ~424 bytes, so we land
-// well under the 32 KB per-launch limit). Models with F > 8 or M > 8
-// take the existing pointer-fed path via launch_fpi.
+// Caps: kMaxFSmallMeta / kMaxMSmallMeta = 8. FpiSmallMeta is ~320 bytes;
+// total cmem[0] ~424 bytes — well under the 32 KB per-launch limit. Models
+// with F > 8 or M > 8 use the pointer-fed path via launch_fpi.
 constexpr int kMaxFSmallMeta = 8;
 constexpr int kMaxMSmallMeta = 8;
 

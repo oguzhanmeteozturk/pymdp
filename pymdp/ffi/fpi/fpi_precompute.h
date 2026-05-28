@@ -56,10 +56,8 @@ struct ModalityDispatch {
   std::array<int64_t, kMaxFfiDependencyRank> f_offs;
 };
 
-// Unification seam: a future ModalityMeta<MaxRank> unification with
-// neg_efe's per-modality metadata struct can land behind this typedef
-// without touching call sites. Today the two structs share only the
-// (K, Ss, lp_offs) trio; the rest is FPI-specific (K>=4 F-chain offsets).
+// Seam for future unification with neg_efe's ModalityMeta; the two structs
+// share (K, Ss, lp_offs) but FPI adds K>=4 F-chain offsets.
 using FpiModalityMeta = ModalityDispatch;
 
 // Build the per-modality dispatch table. Validates each modality's dep rank

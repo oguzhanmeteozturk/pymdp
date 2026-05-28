@@ -35,17 +35,13 @@ inline void modality_K1(const float* __restrict__ ll_m, int64_t S0, float* __res
 //   marg0[s0] = sum_{s1} ll[s0,s1] * q1[s1]   → log_q[deps[0]]
 //   marg1[s1] = sum_{s0} ll[s0,s1] * q0[s0]   → log_q[deps[1]]
 //
-// Fused single-pass over ll: per (s0, s1) read v = ll[s0,s1] once and feed
-// both a per-row reduction (marg0) and a per-column RMW (marg1), halving ll
-// bandwidth when S0*S1 straddles the L1 boundary. The inner s1 loop
-// auto-vectorizes — both streams (q1 read, log_q_d1 RMW) are unit-stride
-// contiguous, so the FMA for sum_d0 and the FMA for log_q_d1[s1] += qs0*v
-// share v in registers.
-// All five pointers reference distinct memory: ll_m is in ll_flat, q0/q1 are
-// non-overlapping slices of scratch_q (distinct lp_offs guaranteed by the
-// dedup check in build_modality_dispatch), log_q_d0/log_q_d1 are
-// non-overlapping slices of scratch_log_q. Restrict lets the compiler keep
-// q1[s1] and qs0 in registers across the log_q_d1 RMW.
+// Fused single-pass: per (s0, s1) read v once and feed both a per-row
+// reduction (marg0) and a per-column RMW (marg1). The inner s1 loop
+// auto-vectorizes over unit-stride contiguous q1/log_q_d1.
+// All five pointers reference distinct memory: ll_m is in ll_flat, q0/q1
+// are non-overlapping slices of scratch_q (distinct lp_offs guaranteed by
+// the dedup check in build_modality_dispatch), log_q_d0/log_q_d1 are
+// non-overlapping slices of scratch_log_q.
 inline void modality_K2(const float* __restrict__ ll_m, int64_t S0, int64_t S1, const float* __restrict__ q0,
                         const float* __restrict__ q1, float* __restrict__ log_q_d0, float* __restrict__ log_q_d1) {
   for (int64_t s0 = 0; s0 < S0; ++s0) {
@@ -66,22 +62,15 @@ inline void modality_K2(const float* __restrict__ ll_m, int64_t S0, int64_t S1, 
 //   marg1[s1]  = sum_{s0, s2} ll[s0,s1,s2] * q0[s0] * q2[s2]   → log_q[deps[1]]
 //   marg2[s2]  = sum_{s0, s1} ll[s0,s1,s2] * q0[s0] * q1[s1]   → log_q[deps[2]]
 //
-// Single-pass fusion: walk ll once and accumulate marg1 + marg2 directly
-// during the t01 build. For each (s0, s1):
-//   sum_t01 = sum_{s2} ll[s0,s1,s2] * q2[s2]   (the t01 element)
-//   log_q_d1[s1] += q0[s0] * sum_t01           (folds toward marg1)
-//   log_q_d2[s2] += (q0[s0] * q1[s1]) * v      (folds toward marg2, inside s2 loop)
-//
-// This eliminates the scratch_t12 buffer (size S1*S2) and two post-pass
-// axpy_fold_leading_add calls for marg1/marg2. Only marg0 still needs t01
-// because its sgemv (sum over s1 of t01[s0,s1]*q1[s1]) can't be folded into
-// the inner loop without re-reading per-(s0,s1) values.
-//
-// Numerics: the accumulation order for log_q_d1 / log_q_d2 changes from a
-// single full-buffer fold over S0×S1 (resp. S1×S2) to a streaming partial
-// accumulation interleaved with the (s0, s1) loop. Floating-point sums
-// reorder; max observed |q - q_ref| under test_fpi_ffi.py's 1e-6 atol stays
-// in low-1e-7 territory.
+// Single-pass fusion: walk ll once and for each (s0, s1) accumulate marg1
+// and marg2 inline during the t01 build:
+//   sum_t01 = sum_{s2} ll[s0,s1,s2] * q2[s2]
+//   log_q_d1[s1] += q0[s0] * sum_t01
+//   log_q_d2[s2] += (q0[s0] * q1[s1]) * v   (inside s2 loop)
+// marg0 still requires t01 (its sgemv over s1 can't be folded without
+// re-reading per-(s0,s1) values). Accumulation order for marg1/marg2
+// differs from a single full-buffer fold; max |q - q_ref| stays in
+// low-1e-7 range (test_fpi_ffi.py atol=1e-6).
 //
 // scratch_t01 must be sized >= S0*S1.
 inline void modality_K3(const float* __restrict__ ll_m, int64_t S0, int64_t S1, int64_t S2,
@@ -133,12 +122,9 @@ inline void modality_Kn(int K, const float* __restrict__ ll_m, const int32_t* __
                         const int64_t* __restrict__ f_offs, const float* const* __restrict__ qs,
                         float* const* __restrict__ log_q_outs, float* __restrict__ fchain_buf,
                         float* __restrict__ suffix_buf) {
-  // Caller-side precondition: K in [4, kMaxFfiDependencyRank]. The dispatch
-  // in fpi_one_batch gates this branch on `md.K >= 4` and
-  // build_modality_dispatch validates `K <= kMaxFfiDependencyRank` before
-  // populating the dispatch table. `__builtin_unreachable` lets the optimizer
-  // eliminate the guard entirely AND silences clang-analyzer-security.
-  // ArrayBound on the `tail[K - 1]` reads below.
+  // Caller-validated: K in [4, kMaxFfiDependencyRank] (build_modality_dispatch
+  // checks upper bound; fpi_one_batch gates on K>=4). __builtin_unreachable
+  // lets the optimizer drop the guard and silences clang-analyzer ArrayBound.
   if (K < 1 || K > kMaxFfiDependencyRank) __builtin_unreachable();
 
   // ---- 1. Build suffix_q chain (reverse): suffix_q[k] = q_{k+1} ⊗ suffix_q[k+1].

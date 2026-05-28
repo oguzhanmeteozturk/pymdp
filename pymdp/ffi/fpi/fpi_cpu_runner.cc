@@ -25,21 +25,12 @@
 namespace pymdp_ffi {
 namespace {
 
-// Per-call scratch with two distinct usage patterns:
-//
-//   1. mods (dispatch table): built once on the master thread BEFORE the
-//      parallel region. Workers access the master's mods via the const
-//      pointer passed into fpi_one_batch — TLS is regular memory and the
-//      OMP barrier ensures the master outlives all readers.
-//   2. log_q / q / t01 / prefix / suffix (compute scratch): each OMP worker
-//      calls ensure_buffers on its OWN g_fpi_scratch inside the parallel
-//      region and uses its own buffers. No false sharing or cross-worker
-//      writes.
-//
-// Resize-up-only via ScratchBuffer<float>; pymdp's call patterns repeat the
-// same shapes for many calls, so the steady-state allocation count is zero
-// after warm-up — that holds per-thread too, since libgomp pools workers
-// across calls.
+// Per-call scratch. `mods` is built once on the master thread before the
+// parallel region; workers read it via a const pointer — the OMP barrier
+// ensures the master outlives all readers. Compute scratch (log_q … suffix)
+// is per-worker: each OMP thread calls ensure_buffers on its own TLS copy.
+// ScratchBuffer is resize-up-only; steady-state allocation count is zero
+// after warm-up (libgomp pools workers across calls).
 struct FpiScratch {
   ScratchBuffer<float>          log_q;
   ScratchBuffer<float>          log_q_prev;  // convergence-check snapshot of prior iter's log_q
@@ -67,10 +58,7 @@ inline thread_local FpiScratch g_fpi_scratch{};
 
 }  // namespace
 
-// Shared kernel body. Both FpiCpu (platform="cpu", host buffers) and
-// FpiCudaHost (platform="CUDA", device buffers aliased or D2H'd into host
-// scratch) funnel through here so the validated K=1/2/3 hot paths + K>=4
-// forward-chain generic path + batch OMP path are written exactly once.
+// Shared kernel body used by both FpiCpu and FpiCudaHost.
 // Inputs/outputs are raw host pointers + counts.
 FfiError run_fpi_kernel_host(const float* ll_flat, int64_t ll_count, const float* lp_flat, int64_t lp_count,
                              float* q_out, int64_t q_count, FfiInt64Span S, FfiInt64Span ll_offsets,
@@ -106,9 +94,7 @@ FfiError run_fpi_kernel_host(const float* ll_flat, int64_t ll_count, const float
                  static_cast<int>(num_iter), static_cast<long long>(total_S), us);
   });
 
-  // Dispatch one batch element. Body is identical between the serial and
-  // parallel paths; omp_fire_if handles the structural serial/parallel split
-  // that dodges libomp's 1-thread-team overhead on the small-batch path.
+  // omp_fire_if avoids libomp's 1-thread-team overhead on small batches.
   const ModalityDispatch* mods_ptr = sc.mods.data();
   const int64_t           ni       = num_iter;
   omp_fire_if(

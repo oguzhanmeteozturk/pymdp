@@ -44,17 +44,11 @@ FfiError refresh_fpi_cuda_cache(FfiInt64Span S_span, FfiInt64Span ll_offsets, Ff
   FpiCudaDeviceScratch& cs = g_fpi_cuda_dev_scratch;
 
   // Two-tier host-side metadata cache:
-  //   1. Pointer-identity fast path: XLA's static-attr buffer is
-  //      pointer-stable across calls of the same compiled executable.
-  //      Compare the five attr-span begin pointers + sizes against the
-  //      last upload. On hit we skip the FNV-1a pass entirely.
-  //   2. FNV-1a content hash (fallback): runs only when pointers/sizes
-  //      diverge. Hashes the raw attr spans plus an F/M shape tag and
-  //      short-circuits when it matches the last upload. Hashing raw
-  //      attrs (instead of the built host dispatch table) lets us skip
-  //      validate_fpi_attrs and the per-modality K/factor-range checks
-  //      on a hit, since those would all pass again with byte-identical
-  //      inputs.
+  //   1. Pointer-identity fast path: compare the five attr-span begin
+  //      pointers + sizes against the last upload; on hit skip the hash.
+  //   2. FNV-1a content hash (fallback) when pointers/sizes diverge.
+  // A hit on either tier skips validate_fpi_attrs and the dispatch rebuild,
+  // since byte-identical inputs would re-pass and re-produce the same table.
   const bool ptr_cache_hit =
       cs.sig != 0 && cs.last_S_ptr == S_span.begin() && cs.last_S_size == S_span.size() &&
       cs.last_ll_offsets_ptr == ll_offsets.begin() && cs.last_ll_offsets_size == ll_offsets.size() &&
@@ -68,8 +62,11 @@ FfiError refresh_fpi_cuda_cache(FfiInt64Span S_span, FfiInt64Span ll_offsets, Ff
     sig            = cs.sig;
     host_cache_hit = true;
   } else {
-    sig            = fpi_layout_signature(FpiSpans{S_span, ll_offsets, lp_offsets, A_dep_flat, A_dep_offsets}, F, M);
-    host_cache_hit = (sig != 0) && (sig == cs.sig);
+    sig = fpi_layout_signature(FpiSpans{S_span, ll_offsets, lp_offsets, A_dep_flat, A_dep_offsets}, F, M);
+    // 0 is the cold-cache sentinel for cs.sig, so a hash of 0 would never
+    // promote and would re-upload on every call. Bump it to a nonzero value.
+    if (sig == 0) sig = 1;
+    host_cache_hit = (sig == cs.sig);
   }
 
   if (!host_cache_hit) {
@@ -119,6 +116,16 @@ FfiError refresh_fpi_cuda_cache(FfiInt64Span S_span, FfiInt64Span ll_offsets, Ff
         }
         md.Ss[i]      = S_host[d];
         md.lp_offs[i] = lp_offsets_host[d];
+        // Duplicate factor within a modality aliases two log_q slices onto
+        // the same offset, silently corrupting the update. can_handle_fpi
+        // rejects this up front; this is the C++ safety net (mirrors
+        // build_modality_dispatch).
+        for (int64_t j = 0; j < i; ++j) {
+          if (md.lp_offs[j] == md.lp_offs[i]) {
+            return invalid_arg(kFpiKernelName,
+                               "modality " + std::to_string(m) + " has duplicate factor in A_dependencies");
+          }
+        }
       }
       for (int64_t i = K; i < fpi_cuda::kRankMax; ++i) {
         md.Ss[i]      = 0;
@@ -201,11 +208,8 @@ FfiError refresh_fpi_cuda_cache(FfiInt64Span S_span, FfiInt64Span ll_offsets, Ff
     cs.sig = sig;
   }
 
-  // Refresh pointer-identity record whenever the incoming attr pointers
-  // differ from the last record. Covers both the upload-miss path (sig
-  // changed → re-uploaded above) and the rare content-hit-with-different-
-  // pointers case (sig matched but pointers diverged — possible across
-  // executables sharing identical model metadata).
+  // Refresh the pointer-identity record whenever the incoming attr pointers
+  // differ, so the next call can take the fast path.
   if (!ptr_cache_hit) {
     cs.last_S_ptr              = S_span.begin();
     cs.last_S_size             = S_span.size();

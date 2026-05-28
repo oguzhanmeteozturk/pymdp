@@ -73,14 +73,9 @@ FfiError FpiCudaDevice(cudaStream_t stream, FfiF32Buf ll_flat_dev, FfiF32Buf lp_
   PYMDP_TRY(check_count(kFpiKernelName, "ll_flat", ll_flat_dev.element_count(), batch * total_ll));
   PYMDP_TRY(check_count(kFpiKernelName, "q_out", q_out_dev->element_count(), batch * total_S));
 
-  // Diagnostic bypass: when PYMDP_FFI_FPI_KERNEL_NOOP=1 is set,
-  // short-circuit to an empty kernel with the same grid/block/shmem
-  // footprint as launch_fpi. Bench delta vs the real kernel at the same
-  // fixture shape bounds the XLA-dispatch + cuLaunchKernel +
-  // driver-roundtrip overhead share of fixture wall time. Skips the
-  // cache build/upload too — those are only there to feed the real
-  // kernel, and on cache hit they're already ~free, so isolating
-  // launch-only overhead is the cleaner measurement.
+  // Diagnostic bypass (PYMDP_FFI_FPI_KERNEL_NOOP=1): launch empty kernel
+  // with matching grid/block/shmem. Bench delta vs real launch isolates
+  // kernel-internal work from XLA-dispatch + driver overhead.
   static const bool kFpiNoopMode = []() {
     const char* v = std::getenv("PYMDP_FFI_FPI_KERNEL_NOOP");
     return v != nullptr && v[0] != '\0' && v[0] != '0';

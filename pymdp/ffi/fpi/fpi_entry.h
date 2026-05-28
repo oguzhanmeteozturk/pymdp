@@ -28,6 +28,7 @@ inline FfiError validate_fpi_attrs(FfiInt64Span S, FfiInt64Span ll_offsets, FfiI
   }
   PYMDP_TRY(check_span_size(kFpiKernelName, "lp_offsets", static_cast<int64_t>(lp_offsets.size()), F + 1));
   PYMDP_TRY(check_span_size(kFpiKernelName, "ll_offsets", static_cast<int64_t>(ll_offsets.size()), M + 1));
+  PYMDP_TRY(check_span_size(kFpiKernelName, "A_dep_offsets", static_cast<int64_t>(A_dep_offsets.size()), M + 1));
   if (num_iter <= 0) {
     return invalid_arg(kFpiKernelName, "num_iter = " + std::to_string(num_iter) + ", must be positive");
   }

@@ -27,15 +27,12 @@ struct FpiSpans {
 };
 
 // FNV-1a fingerprint over the five attr-span byte ranges plus an (F, M)
-// shape tag. Used as the CUDA dispatch-table cache key in fpi_cuda_cache —
-// hashing the raw attrs (instead of the built host-side dispatch table)
-// means cache hits skip both the H2D uploads *and* validate_fpi_attrs +
-// the per-modality dispatch build on the host.
+// shape tag. Used as the CUDA dispatch-table cache key in fpi_cuda_cache.
+// Hashing the raw attrs skips both H2D uploads and validate_fpi_attrs +
+// per-modality dispatch build on cache hits.
 //
-// `sig == 0` is reserved for "never uploaded yet" so the initial cache
-// state never spuriously hits; fnv1a64's output is virtually never zero
-// for non-empty input (probability ~2^-64), and a hypothetical collision
-// is treated as a miss — re-validate, re-build, re-upload.
+// `sig == 0` is reserved for "never uploaded yet" (initial cache state);
+// a collision is treated as a miss — re-validate, re-build, re-upload.
 inline uint64_t fpi_layout_signature(const FpiSpans& spans, int64_t F, int64_t M) {
   uint64_t sig = fnv1a64(spans.S.begin(), static_cast<size_t>(spans.S.size()) * sizeof(int64_t));
   sig = fnv1a64(spans.ll_offsets.begin(), static_cast<size_t>(spans.ll_offsets.size()) * sizeof(int64_t), sig);

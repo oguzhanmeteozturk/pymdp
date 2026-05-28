@@ -1,26 +1,15 @@
 // Native CUDA FPI kernel — one block per batch element, all `num_iter`
 // fixed-point iterations executed internally.
 //
-// Algorithm mirrors fpi_cpu_runner.cc's run_fpi_kernel_host body (per-iter softmax →
-// reset to log_prior → modality marginals → convergence check), but lifted
-// into a single kernel so the entire FPI run stays on the CUDA stream
-// without any host roundtrip. That eliminates the FpiCudaHost shim's
-// per-call cudaStreamSynchronize, which was the structural cost behind the
-// ~1 ms/call regression in rollout fixtures on sm_87.
+// Algorithm mirrors fpi_cpu_runner.cc's run_fpi_kernel_host body (per-iter
+// softmax → reset to log_prior → modality marginals → convergence check),
+// lifted into a single kernel so the whole run stays on the CUDA stream with
+// no host roundtrip.
 //
-// Per-modality marginal accumulation uses three independent passes over
-// `ll_m` (one output factor per pass), trading a 3× re-read of the modality
-// likelihood for atomic-free writes to log_q. The CPU kernel fuses these
-// passes; on GPU the no-atomic structure is simpler, ll_m fits in L1 for
-// production shapes (S0*S1*S2 < 1 KB), and Ampere's L1 hit-rate makes the
-// re-reads ~free. If profiling shows ll re-fetch hurting we can revisit
-// the fused approach with shmem-atomic writes.
-//
-// Block size = 128 (4 warps). Picked for state sizes ~32: each warp covers
-// one factor's softmax in one shot, the multi-warp count gives enough
-// parallel slots for the modality passes to keep an sm_87 SM busy.
-// Larger blocks would waste threads on the small inner
-// dims; smaller blocks underutilize the warp-shuffle reductions.
+// Per-modality marginal accumulation uses K independent passes over `ll_m`
+// (one output factor per pass), trading a re-read of the modality likelihood
+// for atomic-free writes to log_q. ll_m fits in L1 for production shapes
+// (S0*S1*S2 < 1 KB) so the re-reads stay cheap.
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -32,13 +21,8 @@ namespace fpi_cuda {
 
 namespace {
 
-// Block size 256 (8 warps): 128 was latency-stall-bound on sm_87 due to
-// warp-pool starvation (too few warps to hide L1/shmem latency chains).
-// K=3 / K=2 split-reduce widths (kTpO) target full block utilization at
-// this size — see modality_K3_split's header. ncu on fpi_large reports
-// barrier stalls dominate (49%) and warps_eligible=1%, so predicate-off
-// warps aren't measurably hiding latency here; keep the block size tight
-// to active lanes via kTpO instead of relying on idle-warp slots.
+// Block size 256 (8 warps). K=3 / K=2 split-reduce widths (kTpO) target full
+// block utilization at this size — see modality_K3_split's header.
 constexpr int kBlockSize = 256;
 constexpr int kWarpSize  = 32;
 constexpr int kNumWarps  = kBlockSize / kWarpSize;  // 8
@@ -64,20 +48,10 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 
 // ----- Block-level reductions via single-sync redundant-warp pattern -----
 //
-// `scratch` must be at least kNumWarps floats. Returns the block-wide max
-// to every thread.
-//
-// Earlier two-sync version had warp 0 read scratch[0..kNumWarps), warp-
-// reduce to a single value, write back to scratch[0], then a trailing
-// __syncthreads to broadcast scratch[0] to non-warp-0 threads. With ncu
-// showing warps_eligible ~1% on fpi_large, that second block-wide sync
-// was load-bearing on the barrier stall budget (block_reduce_max runs
-// per iter, ~15 calls per call at num_iter=16). Replaced with redundant-
-// warp reduction: every warp reads scratch[0..kNumWarps), warp-shuffle-
-// reduces locally, and arrives at the same answer without a broadcast
-// sync. Cost: 7 extra warps do ~5 shuffles each (~5 cycles), running in
-// parallel — wall-time per warp is unchanged. Lanes [kNumWarps, 32) seed
-// from -INFINITY so warp_reduce_max returns the correct max-over-warps.
+// `scratch` must be at least kNumWarps floats. Returns the block-wide max to
+// every thread. Every warp redundantly reads scratch[0..kNumWarps) and
+// warp-shuffle-reduces, so no broadcast sync is needed. Lanes [kNumWarps, 32)
+// seed from -INFINITY so warp_reduce_max returns the correct max-over-warps.
 __device__ __forceinline__ float block_reduce_max(float v, float* scratch) {
   const int tid  = threadIdx.x;
   const int lane = tid & (kWarpSize - 1);
@@ -110,15 +84,10 @@ __device__ __forceinline__ float group_reduce_sum(float v) {
 
 // ----- Single-warp softmax over `n` floats -----
 //
-// Same three-pass stable softmax as `softmax_block`, but reductions are
-// pure warp shuffles — no shared-memory scratch, no __syncthreads. Caller
-// arranges one warp per softmax (used to run the F per-factor softmaxes
-// concurrently across the block's kNumWarps warps).
-//
-// Fast path for n <= 32 (every production factor S_f): keep the exp result
-// in a register and write the normalized value once, instead of write-then-
-// read-then-rewrite via shmem. The generic path remains for any future
-// shape with S_f > 32.
+// Three-pass stable softmax with pure warp-shuffle reductions; one warp per
+// softmax. Fast path for n <= 32 keeps the exp result in a register. A
+// degenerate sum (all-`-inf` input -> s is 0 or NaN) falls back to uniform
+// 1/n, mirroring softmax_inplace.
 __device__ void softmax_warp(const float* __restrict__ in, float* __restrict__ out, int n) {
   const int lane = threadIdx.x & (kWarpSize - 1);
 
@@ -128,7 +97,8 @@ __device__ void softmax_warp(const float* __restrict__ in, float* __restrict__ o
     const float m      = warp_reduce_max(x);
     const float e      = active ? __expf(x - m) : 0.0f;
     const float s      = warp_reduce_sum(e);
-    if (active) out[lane] = e / s;
+    const bool  ok     = s > 0.0f && isfinite(s);
+    if (active) out[lane] = ok ? e / s : 1.0f / n;
     return;
   }
 
@@ -144,11 +114,11 @@ __device__ void softmax_warp(const float* __restrict__ in, float* __restrict__ o
     out[i]        = e;
     my_sum += e;
   }
-  const float s = warp_reduce_sum(my_sum);
-
-  const float inv = 1.0f / s;
+  const float s   = warp_reduce_sum(my_sum);
+  const bool  ok  = s > 0.0f && isfinite(s);
+  const float inv = ok ? 1.0f / s : 0.0f;
   for (int i = lane; i < n; i += kWarpSize) {
-    out[i] *= inv;
+    out[i] = ok ? out[i] * inv : 1.0f / n;
   }
 }
 
@@ -170,15 +140,12 @@ __device__ void modality_K1(const float* __restrict__ ll_m, int S0, float* __res
 // lane 0 of each group writes the final sum. Pure warp-shuffle reduce with
 // zero __syncthreads inside the pass.
 //
-// IMPORTANT: the group_reduce_sum shuffles must execute on ALL lanes of every
-// warp that touches the pass, regardless of whether the lane's output index
-// is in range. If we gated the shuffle behind `if (out_id < S)` and a warp
-// straddled the boundary (e.g. S=6 with kTpO=4 → out_ids 0..5 enter, 6..7
-// skip), the active lanes would call __shfl_xor_sync(0xffffffff, ...) with
-// inactive lanes 24..31 missing — undefined behavior that hangs on Ampere.
-// Instead we iterate stripes, let out-of-range lanes contribute sum=0, and
-// run the shuffle unconditionally; only the in-range lane 0 of each group
-// writes back.
+// IMPORTANT: group_reduce_sum's shuffles must run on ALL lanes regardless of
+// whether the lane's output index is in range. Gating the shuffle behind
+// `if (out_id < S)` when a warp straddles the boundary calls
+// __shfl_xor_sync(0xffffffff, ...) with lanes missing — UB that hangs on
+// Ampere. Instead, iterate stripes, let out-of-range lanes contribute sum=0,
+// run the shuffle unconditionally, and only the in-range lane 0 writes back.
 template <int kTpO>
 __device__ void modality_K2_split(const float* __restrict__ ll_m, int S0, int S1, const float* __restrict__ q0,
                                   const float* __restrict__ q1, float* __restrict__ log_q_d0,
@@ -188,19 +155,12 @@ __device__ void modality_K2_split(const float* __restrict__ ll_m, int S0, int S1
   const int red_id = tid & (kTpO - 1);
   const int stride = kBlockSize / kTpO;
 
-  // No __syncthreads between Pass 1 and Pass 2: Pass 1 writes log_q_d0 and
-  // Pass 2 writes log_q_d1 (distinct factor slices by FFI contract on
-  // lp_offs), and neither pass reads log_q within this modality — they only
-  // read q (stable from the softmax phase) and ll. The trailing barrier at
-  // the end of the function covers cross-modality WAW on shared factors.
-
-  // Inner FMA loops use 4-way accumulator splitting to break the single-
-  // dependency-chain pattern (`sum_{i+1} = sum_i + ...`). A single
-  // accumulator stalls on the ~4-cycle Ampere FMA latency register chain;
-  // with 4 independent accumulators the compiler can issue 4 FMAs per cycle
-  // pair instead of 1, a ~4x ILP improvement that directly attacks that stall.
-  // Tail handling for non-multiple-of-4 strides (production shapes are all
-  // multiples of 4 so the tail is empty in the hot path).
+  // No intra-modality __syncthreads: the two passes write distinct factor
+  // slices (lp_offs) and read only q (stable from softmax) and ll. The
+  // function-exit barrier covers cross-modality WAW on shared factors.
+  //
+  // Inner FMA loops use 4-way accumulator splitting for ILP; the scalar tail
+  // handles non-multiple-of-4 strides (empty for production shapes).
 
   // Pass 1: log_q_d0[s0] += sum_{s1} ll[s0,s1] * q1[s1]
   for (int s0_base = 0; s0_base < S0; s0_base += stride) {
@@ -253,43 +213,10 @@ __device__ void modality_K2_split(const float* __restrict__ ll_m, int S0, int S1
 
 // ----- K=3 modality, three-pass with per-pass kTpO split across the inner reduce -----
 //
-// Same structure as modality_K2_split, but the three passes carry their own
-// threads-per-output template parameter so each can be sized to its output
-// dim independently. For production shapes (S0=32, S1=24, S2=16) under
-// kBlockSize=256, block utilization across passes for the currently-shipping
-// callsite <8, 8, 8>:
-//
-//     Pass 1 (out=S0=32): 32 * 8 = 256  -> 100%
-//     Pass 2 (out=S1=24): 24 * 8 = 192  ->  75%
-//     Pass 3 (out=S2=16): 16 * 8 = 128  ->  50%
-//
-// Pass 3 runs at 50% utilization deliberately — see tuning history below.
-//
-// Tuning history (Orin sm_87, fpi_large, ncu --stalls):
-//
-//     <4,4,8>   barrier 49% short_scoreboard 11% warps_elig 1.02% inst/cyc 0.12
-//     <8,8,16>  barrier 15% short_scoreboard 38% warps_elig 1.02% inst/cyc 0.11
-//     <8,8,8>   barrier 23% short_scoreboard 33% warps_elig 1.14% inst/cyc 0.13
-//
-// The original <4,4,8> was tuned against kBlockSize=128 (where it gave
-// 100/75/50%), under-utilized at the kBlockSize=256 it now runs on
-// (50/37.5/50%), and showed barrier stalls dominating at 49%.
-// <8,8,16> rebalanced barrier→short_scoreboard but didn't move the
-// throughput proxies (warps_eligible / inst/cycle) — the extra shuffle
-// step in group_reduce_sum<16> (4 vs 3) plus the 3x shuffle volume across
-// retuned passes cancelled the utilization win. <8,8,8> catches ~75% of
-// the barrier improvement while keeping pass 3 at group_reduce_sum<8>;
-// it's the first variant where warps_eligible (→1.14) and inst/cycle
-// (→0.13) actually rise above the <4,4,8> baseline. Pass 3 runs at 50%
-// utilization but the shuffle-throughput win exceeds the lost lanes.
-//
-// Accumulator-unroll constraint: each pass's inner s2 loop uses a 4-way
-// FMA unroll with `step = 4`, which fits S2=16 (4 iters) and S1=24 (5 iters
-// + tail of 4) without falling into the scalar tail.
-// Other shapes can override the template — the K=2 helper stays at a
-// single shared kTpO=4 because its inner-reduce ranges (16/24/32) are
-// too small for the 4-way accumulator step at kTpO=8 (would skip the
-// unroll entirely and fall to the scalar tail).
+// Same structure as modality_K2_split, but each of the three passes carries
+// its own threads-per-output template parameter so it can be sized to its
+// output dim independently. The shipping callsite uses <8, 8, 8>, tuned
+// empirically on Orin sm_87 for production shapes S=[32,24,16].
 template <int kTpO_p1, int kTpO_p2, int kTpO_p3>
 __device__ void modality_K3_split(const float* __restrict__ ll_m, int S0, int S1, int S2,
                                   const float* __restrict__ q0, const float* __restrict__ q1,
@@ -298,27 +225,11 @@ __device__ void modality_K3_split(const float* __restrict__ ll_m, int S0, int S1
   const int tid = threadIdx.x;
   const int S12 = S1 * S2;
 
-  // See header comment on modality_K2_split for why the shuffle must run on
-  // all lanes regardless of out-of-range out_id, and for why intra-pass
-  // __syncthreads barriers can be dropped (each pass writes a distinct
-  // factor slice; the trailing sync at function exit handles cross-modality
-  // WAW on shared factors).
-  //
-  // Inner reductions are split across the kTpO lanes on the OUTER contracted
-  // dim (not on the flat S_a * S_b range) so we avoid the `i / S_b`,
-  // `i - s_a * S_b` divisions that nvcc otherwise emits as 32-bit divs in
-  // the hot inner loop. The outer split is slightly less balanced when the
-  // outer dim is < kTpO (e.g. S0=4 with kTpO=4 → only one row per lane), but
-  // for production shapes the contracted outer dim ≥ 8 and the divide-free
-  // form wins on Maxwell+Ampere where integer div is a multi-cycle uop.
-
-  // Inner FMA loops use 4-way accumulator splitting per pass to break the
-  // single-dependency-chain pattern. See modality_K2_split's header for the
-  // ILP rationale (~4x compiler issue width vs single accumulator). The
-  // accumulators are kept across the per-lane outer loop so the dependency
-  // chain depth is total_inner_work / 4 instead of total_inner_work, where
-  // total_inner_work for production K=3 is e.g. (S1/kTpO_p1) * S2 = 6*16 =
-  // 96 FMAs serialized through one accumulator.
+  // See modality_K2_split's header for why the shuffle must run on all lanes
+  // and why intra-pass __syncthreads can be dropped. Inner reductions split
+  // across the kTpO lanes on the OUTER contracted dim (not the flat S_a*S_b
+  // range) to avoid the per-iter integer divisions nvcc would otherwise emit.
+  // 4-way accumulator splitting per pass for ILP.
 
   // Pass 1: log_q_d0[s0] += sum_{s1, s2} ll[s0,s1,s2] * q1[s1] * q2[s2]
   {
@@ -423,17 +334,10 @@ __device__ void modality_K3_split(const float* __restrict__ ll_m, int S0, int S1
 //   [2*total_S, 3*total_S)    log_q_prev (convergence snapshot)
 //   [3*total_S, 3*total_S+kNumWarps)  reduce scratch
 //
-// Total dynamic shmem = (3 * total_S + kNumWarps) floats ≈ 4 * total_S * 4 B.
-// For production shapes (total_S ~ 100) that's ~1.6 KB per block — trivial,
-// and one block per SM is the right occupancy for this small-batch regime.
-//
-// The log_q -> log_q_prev snapshot is folded into the per-iter softmax pass
-// (see the softmax dispatch loop below): each warp that softmaxes a factor
-// also writes that factor's log_q slice to log_q_prev while log_q is hot in
-// shmem from the softmax load. The block-wide barrier closing the softmax
-// chunk covers both writes, so the convergence check needs no extra
-// __syncthreads — the only convergence-side cost in steady state is the
-// block_reduce_max at iter end.
+// Total dynamic shmem = (3 * total_S + kNumWarps) floats. The log_q ->
+// log_q_prev convergence snapshot is folded into the per-iter softmax pass
+// (see the softmax dispatch loop below), so the convergence check costs only
+// the block_reduce_max at iter end.
 __global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, total_ll]
                            const float* __restrict__ lp_flat,    // [batch, total_S]
                            float* __restrict__       q_out,      // [batch, total_S]
@@ -464,32 +368,18 @@ __global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, tota
   }
   __syncthreads();
 
-  // Threads-per-output for the K=2/K=3 split-reduce passes. kTpO=4 picks the
-  // sweet spot for production shapes (S_f ≤ 32): up to 32 outputs handled in
-  // parallel by 32*4=128 threads, vs the pre-split design where 32 outputs
-  // ran on a single warp with 3 warps idle. Larger kTpO would help shapes
-  // with very small S_f but would idle lanes when S_f ≥ 32. Templated so the
-  // compiler unrolls the group-reduce shuffle chain.
+  // Threads-per-output for the K=2 split-reduce passes (K=3 overrides per
+  // pass at its callsite). kTpO=4 suits production shapes (S_f ≤ 32).
   constexpr int kTpO = 4;
 
   const int warp_id = threadIdx.x / kWarpSize;
-
-  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int lane    = threadIdx.x & (kWarpSize - 1);
 
   for (int it = 0; it < num_iter; ++it) {
-    // q[f] = softmax(log_q[f]) per factor — run F softmaxes concurrently
-    // across the block's kNumWarps warps. Each warp handles one factor at a
-    // time using pure warp-shuffle reductions (no __syncthreads inside).
-    // When F > kNumWarps we loop in chunks of kNumWarps.
-    //
-    // Convergence snapshot folded in: while the warp's softmax is reading
-    // log_q[off..off+n], we also write log_q[off+i] to log_q_prev[off+i] in
-    // the same warp pass. This eliminates a standalone snapshot loop +
-    // __syncthreads at iter start. The chunk-trailing __syncthreads below
-    // covers both the softmax q-writes and the snapshot prev-writes, so no
-    // extra barrier is needed. Shared memory bandwidth is plentiful at this
-    // shape (~32 floats per factor) and log_q is hot in shmem from the
-    // softmax load, so the fused snapshot is essentially free.
+    // q[f] = softmax(log_q[f]) per factor — F softmaxes run concurrently
+    // across the kNumWarps warps (one factor per warp, chunked when
+    // F > kNumWarps). The log_q -> log_q_prev convergence snapshot is folded
+    // in here, covered by the chunk-trailing __syncthreads.
     //
     // Do not hoist the trailing __syncthreads out of this loop — nvcc codegen
     // is sensitive here and the rearrangement regresses fpi_large.
@@ -514,15 +404,12 @@ __global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, tota
     }
     __syncthreads();
 
-    // Per-modality marginal accumulation. The modality helpers no longer
-    // emit a trailing __syncthreads; we gate it here via sync_mask so
-    // modalities whose factor writes don't overlap with the next modality's
-    // can run back-to-back without a barrier. The unconditional sync below
-    // (after the loop) covers the final write before the convergence read
-    // and the next iter's softmax — so bit (M-1) of sync_mask is always 0.
-    // See feedback_fpi_cuda_no_op_changes for the SASS-fragility note: if
-    // you change this loop's shape, mirror the exact change in
-    // fpi_kernel_smallmeta below and bench fpi_large first.
+    // Per-modality marginal accumulation. The modality helpers emit no
+    // trailing __syncthreads; sync_mask gates it here so non-overlapping
+    // modalities run back-to-back. The unconditional post-loop sync covers
+    // the final write, so bit (M-1) of sync_mask is always 0.
+    // SASS-fragile: if you change this loop's shape, mirror the exact change
+    // in fpi_kernel_smallmeta below and bench fpi_large first.
     for (int m = 0; m < M; ++m) {
       const ModalityDispatchGpu md   = mods[m];
       const float*              ll_m = ll_b + md.ll_off;
@@ -535,30 +422,15 @@ __global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, tota
                                 log_q + md.lp_offs[0], log_q + md.lp_offs[1]);
         break;
       case 3:
-        // Per-pass kTpO: <8, 8, 8>. See modality_K3_split header — picked
-        // empirically on Orin sm_87 from ncu A/B sweep. Original <4,4,8>
-        // (tuned to kBlockSize=128) gave barrier-stall 49% / warps_eligible
-        // 1.02% on production S=[32,24,16] at kBlockSize=256. Widening to
-        // <8,8,16> dropped barrier to 15% but spiked short_scoreboard to
-        // 38% from the extra shuffle step in group_reduce_sum<16> and
-        // 3x'd shuffle volume across passes — warps_eligible stayed at
-        // 1.02%, no throughput lift. <8,8,8> catches ~75% of the barrier
-        // win while keeping pass 3 at 3-shuffle group_reduce_sum<8>; it's
-        // the first variant where warps_eligible (→1.14%) and inst/cycle
-        // (→0.13) actually move. Pass 3 runs at 50% utilization here but
-        // the shuffle-throughput win exceeds the utilization loss.
+        // Per-pass kTpO: <8, 8, 8> — tuned empirically on Orin sm_87. See
+        // modality_K3_split header.
         modality_K3_split<8, 8, 8>(ll_m, md.Ss[0], md.Ss[1], md.Ss[2], q + md.lp_offs[0], q + md.lp_offs[1],
                                    q + md.lp_offs[2], log_q + md.lp_offs[0], log_q + md.lp_offs[1],
                                    log_q + md.lp_offs[2]);
         break;
       default:
-        // The host-side gate (can_handle_fpi_cuda_native in _fpi.py) only
-        // dispatches us when all modalities are K<=3. A K>=4 modality
-        // landing here is a contract violation in the dispatch — we'd
-        // produce silently wrong results. CUDA has no exception path; the
-        // closest we can do is a no-op that propagates as garbage output
-        // and gets caught by parity tests. Defending here would cost a
-        // branch in every iteration; we trust the gate.
+        // K>=4 never reaches here — the host gate (can_handle_fpi_cuda_native
+        // in _fpi.py) only dispatches K<=3, and the cache build validates it.
         break;
       }
       if ((sync_mask >> m) & 1u) __syncthreads();
@@ -566,9 +438,7 @@ __global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, tota
     __syncthreads();  // WAW + RAW barrier for convergence read / next softmax
 
     // Convergence check (skip iter 0 — log_q_prev was all-zero, delta is
-    // large by construction). Mirrors the CPU kernel's early-exit. The
-    // log_q_prev snapshot was filled by the softmax phase above, so this
-    // costs only one block-wide max-reduce.
+    // large by construction). Mirrors the CPU kernel's early-exit.
     if (it > 0) {
       float my_max_diff = 0.0f;
       for (int i = threadIdx.x; i < total_S; i += kBlockSize) {
@@ -611,24 +481,16 @@ namespace {
 // path and driver bookkeeping match the real launch byte-for-byte.
 __global__ void fpi_noop_kernel() {}
 
-// fpi_kernel_smallmeta — variant of fpi_kernel that takes the per-call
-// dispatch table (S, lp_offsets, mods) by value as kernel arguments,
-// served from the sm_70+ constant-memory parameter bank. Reads
-// to `meta.S[f]` / `meta.lp_offsets[f]` / `meta.mods[m]` lower to LDC
-// (broadcast to all 32 lanes in one cycle) instead of the pointer-fed
-// kernel's LDG (10-20 cycles even on L1 hit). Used when F <= kMaxFSmallMeta
-// and M <= kMaxMSmallMeta — the host gate in fpi_cuda_runtime.cc enforces this.
+// fpi_kernel_smallmeta — variant of fpi_kernel that takes the dispatch table
+// (S, lp_offsets, mods) by value, served from the constant-memory parameter
+// bank: meta.* reads lower to LDC (one-cycle broadcast) instead of the
+// pointer-fed kernel's LDG. Used when F <= kMaxFSmallMeta and
+// M <= kMaxMSmallMeta — the host gate in fpi_cuda_runtime.cc enforces this.
 //
-// IMPORTANT — keep in sync with fpi_kernel above. The body below is a
-// verbatim copy with three substitutions:
-//   * S[f]          -> meta.S[f]
-//   * lp_offsets[f] -> meta.lp_offsets[f]
-//   * mods[m]       -> meta.mods[m]
-// The duplication is deliberate: refactoring the bodies into a shared
-// templated impl risks shifting the existing fpi_kernel's SASS, and
-// per feedback_fpi_cuda_no_op_changes that kernel is SASS-fragile.
-// If you change algorithm in one, change it in the other; the
-// scripts/sass_diff.sh harness will flag drift.
+// IMPORTANT — keep in sync with fpi_kernel above. The body is a verbatim copy
+// with S[f]/lp_offsets[f]/mods[m] replaced by meta.S[f]/meta.lp_offsets[f]/
+// meta.mods[m]. The duplication is deliberate: a shared templated impl risks
+// shifting fpi_kernel's SASS, which is fragile. scripts/sass_diff.sh flags drift.
 __global__ void fpi_kernel_smallmeta(const float* __restrict__ ll_flat,    // [batch, total_ll]
                                      const float* __restrict__ lp_flat,    // [batch, total_S]
                                      float* __restrict__       q_out,      // [batch, total_S]
@@ -696,18 +558,8 @@ __global__ void fpi_kernel_smallmeta(const float* __restrict__ ll_flat,    // [b
                                 log_q + md.lp_offs[0], log_q + md.lp_offs[1]);
         break;
       case 3:
-        // Per-pass kTpO: <8, 8, 8>. See modality_K3_split header — picked
-        // empirically on Orin sm_87 from ncu A/B sweep. Original <4,4,8>
-        // (tuned to kBlockSize=128) gave barrier-stall 49% / warps_eligible
-        // 1.02% on production S=[32,24,16] at kBlockSize=256. Widening to
-        // <8,8,16> dropped barrier to 15% but spiked short_scoreboard to
-        // 38% from the extra shuffle step in group_reduce_sum<16> and
-        // 3x'd shuffle volume across passes — warps_eligible stayed at
-        // 1.02%, no throughput lift. <8,8,8> catches ~75% of the barrier
-        // win while keeping pass 3 at 3-shuffle group_reduce_sum<8>; it's
-        // the first variant where warps_eligible (→1.14%) and inst/cycle
-        // (→0.13) actually move. Pass 3 runs at 50% utilization here but
-        // the shuffle-throughput win exceeds the utilization loss.
+        // Per-pass kTpO: <8, 8, 8> — tuned empirically on Orin sm_87. See
+        // modality_K3_split header.
         modality_K3_split<8, 8, 8>(ll_m, md.Ss[0], md.Ss[1], md.Ss[2], q + md.lp_offs[0], q + md.lp_offs[1],
                                    q + md.lp_offs[2], log_q + md.lp_offs[0], log_q + md.lp_offs[1],
                                    log_q + md.lp_offs[2]);

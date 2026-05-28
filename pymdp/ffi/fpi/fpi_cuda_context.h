@@ -4,18 +4,12 @@
 // pointer-fed launch path, the by-value `FpiSmallMeta` for the cmem path,
 // and a two-tier attr-span cache key (pointer-identity + FNV-1a sig).
 //
-// Reformulating this single-slot cache onto `common/cache_lru.h::CacheLRU`
-// is structurally awkward — CacheLRU keys off a (const float*, size,
-// layout_sig, content_tag) shape designed for float-buffer payloads with
-// sampled content tags, whereas FPI's natural key is "the five int64
-// attr-span (ptr, size) tuples plus the layout signature." The
-// pointer-identity fast-path here is a real optimization vs. always
-// computing the FNV pass (XLA's static-attr buffer is pointer-stable
-// across calls of the same compiled executable, so calls 2..N skip the hash
-// entirely). Capacity=1 LRU isn't an improvement over the current branchy
-// match; widening CacheLRU's key shape to absorb attr spans would touch
-// every other caller. Revisit only if a second kernel develops the same
-// attr-span cache pattern.
+// Not layered on CacheLRU: FPI's natural key is five int64 attr-span
+// (ptr, size) tuples + a layout sig, whereas CacheLRU keys off float-buffer
+// payloads with sampled content tags — adapting it would touch every other
+// caller. The pointer-identity fast-path is a real win because XLA's
+// static-attr buffer is pointer-stable across calls of the same compiled
+// executable, so calls 2..N skip the FNV pass entirely.
 
 #pragma once
 
@@ -59,13 +53,10 @@ struct FpiCudaDeviceScratch {
   // a fresh-process first call always misses.
   uint64_t sig = 0;
 
-  // Pointer-identity fast cache. XLA stores the static FFI attr arrays in
-  // a per-executable buffer that is pointer-stable across calls of the
-  // same compiled function — so within a rollout the attr spans handed to
-  // us alias the same backing memory each call. Comparing pointers +
-  // sizes (~6 word loads + 6 compares) skips the FNV-1a pass entirely on
-  // a hit. On miss we fall through to the FNV path, which still validates
-  // the content cache via `sig`.
+  // Pointer-identity fast cache. XLA's static-attr buffer is pointer-stable
+  // across calls of the same compiled function, so pointer+size comparison
+  // (~6 word loads + 6 compares) skips the FNV-1a pass on a hit. On miss,
+  // fall through to the FNV path, which validates the content cache via `sig`.
   const int64_t* last_S_ptr              = nullptr;
   const int64_t* last_ll_offsets_ptr     = nullptr;
   const int64_t* last_lp_offsets_ptr     = nullptr;
