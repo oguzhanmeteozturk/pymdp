@@ -1,5 +1,7 @@
 import os
 import math
+from functools import lru_cache
+from types import SimpleNamespace
 from typing import Optional
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -11,14 +13,28 @@ from equinox import field
 from .env import PymdpEnv
 
 
-# load assets
 assets_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets")
-mouse_img = plt.imread(os.path.join(assets_dir, "mouse.png"))
-right_mouse_img = jnp.clip(ndimage.rotate(mouse_img, 90, reshape=True), 0.0, 1.0)
-left_mouse_img = jnp.clip(ndimage.rotate(mouse_img, -90, reshape=True), 0.0, 1.0)
-up_mouse_img = jnp.clip(ndimage.rotate(mouse_img, 180, reshape=True), 0.0, 1.0)
-cheese_img = plt.imread(os.path.join(assets_dir, "cheese.png"))
-shock_img = plt.imread(os.path.join(assets_dir, "shock.png"))
+
+
+@lru_cache(maxsize=1)
+def _load_assets():
+    """Lazily load and rotate render assets on first use.
+
+    Top-level eager loading is avoided because the three `jnp.clip(rotate(...))`
+    ops on the mouse PNG produce a ~63 MB f32 tensor each and ran ~3.8 ms apiece
+    on Orin — a fixed ~12 ms cost that landed in every nsys trace of any pymdp
+    code path that imports `pymdp.envs` (which is most of them), even though
+    the assets are only used by `render` on TMaze.
+    """
+    mouse_img = plt.imread(os.path.join(assets_dir, "mouse.png"))
+    return SimpleNamespace(
+        mouse_img=mouse_img,
+        right_mouse_img=jnp.clip(ndimage.rotate(mouse_img, 90, reshape=True), 0.0, 1.0),
+        left_mouse_img=jnp.clip(ndimage.rotate(mouse_img, -90, reshape=True), 0.0, 1.0),
+        up_mouse_img=jnp.clip(ndimage.rotate(mouse_img, 180, reshape=True), 0.0, 1.0),
+        cheese_img=plt.imread(os.path.join(assets_dir, "cheese.png")),
+        shock_img=plt.imread(os.path.join(assets_dir, "shock.png")),
+    )
 
 
 class BaseTMaze(PymdpEnv):
@@ -329,6 +345,14 @@ class BaseTMaze(PymdpEnv):
         self, observations: list[jnp.ndarray], mode: str = "human", title: Optional[str] = None
     ) -> jnp.ndarray | None:
         batch_size = observations[0].shape[0]
+
+        assets = _load_assets()
+        mouse_img       = assets.mouse_img
+        right_mouse_img = assets.right_mouse_img
+        left_mouse_img  = assets.left_mouse_img
+        up_mouse_img    = assets.up_mouse_img
+        cheese_img      = assets.cheese_img
+        shock_img       = assets.shock_img
 
         plt.clf()
 
