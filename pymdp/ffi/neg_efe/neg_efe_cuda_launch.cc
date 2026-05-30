@@ -8,7 +8,9 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -30,10 +32,49 @@
 namespace pymdp_ffi {
 namespace {
 
+// Small-shape custom stage-1 GEMM (vs cuBLAS). Default ON: a repeatable 3-6% win
+// on the CUDA-routed inductive fixtures on Orin sm_87 (agent_infer_policies
+// _inductive, policy_inference_deep_inductive), parity-clean. Set
+// PYMDP_FFI_SMALL_GEMM=0 to force cuBLAS (escape hatch / A-B measurement).
+inline bool small_gemm_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("PYMDP_FFI_SMALL_GEMM");
+    return e == nullptr || e[0] != '0';  // default on; "0" disables
+  }();
+  return on;
+}
+
+// Gate for the warp-per-output custom kernels (stage-1 GEMM and tmp_lin), which
+// win only on genuinely tiny batched GEMMs where cuBLAS's fixed ~100us 128x128
+// kernel cost dominates real work. Three conditions, all required:
+//   (1) small total work M*N*K — else cuBLAS's tiling amortizes;
+//   (2) a small dimension min(M,N) < 32 — the case the 128x128 tile idles in;
+//   (3) small K — the warp does a single stride-32 reduction over K with an
+//       uncoalesced stride-N read of the other operand, so large K loses to
+//       cuBLAS's K-tiling. Measured: K=4096 (mmp_many_modalities_highdim, rank-2
+//       S0*S1=64*64) regressed forced-CUDA +24% vs cuBLAS; K~768 (rollout /
+//       inductive) wins. Cap sits between.
+constexpr int     kSmallGemmMaxMinDim = 32;
+constexpr int64_t kSmallGemmMaxWork   = 1 << 20;  // 1M MACs
+constexpr int     kSmallGemmMaxK      = 1024;
+
+inline bool use_warp_gemm(int M, int N, int K) {
+  if (!small_gemm_enabled()) return false;
+  if (K > kSmallGemmMaxK) return false;
+  const int64_t work = static_cast<int64_t>(M) * N * K;
+  return work <= kSmallGemmMaxWork && (M < kSmallGemmMaxMinDim || N < kSmallGemmMaxMinDim);
+}
+
 // Computes row-major out[b, m, n] = a_rm[b, m, k] @ q01_outer[b, k, n].
 // The cuBLAS call is column-major, so the GEMM is expressed as C^T = Q^T @ A^T.
+// Small shapes route to a warp-per-output custom kernel (see use_small_q01_gemm).
 FfiError run_batched_q01_gemm(const StageCtx& stage, const char* op, const float* q01_outer, const float* a_rm,
                               float* out_rm, int M_rm, int N_rm, int K_rm) {
+  if (use_warp_gemm(M_rm, N_rm, K_rm)) {
+    CUDA_TRY(op, cuda_kernels::launch_small_batched_gemm_rm(a_rm, q01_outer, out_rm, stage.Bn, M_rm, N_rm, K_rm,
+                                                            stage.stream));
+    return FfiError::Success();
+  }
   const float alpha = 1.0f;
   const float beta  = 0.0f;
   CUBLAS_TRY(op, cublasSgemmStridedBatched(stage.ctx.cublas_handle.handle, CUBLAS_OP_N, CUBLAS_OP_N, N_rm, M_rm, K_rm,
@@ -148,8 +189,14 @@ FfiError launch_modality_rank1(const StageCtx& stage, const QsLevel& qs_next, co
   return FfiError::Success();
 }
 
+// lin_override (when non-null) supplies this modality's linear term already
+// contracted into [.., H_kk] with per-batch stride lin_b_stride — used when a
+// dependency group's linear terms were batched into one stacked GEMM upstream
+// (see launch_rank2_group_linear). When null, the per-modality linear GEMM runs
+// here with stride H_kk.
 FfiError launch_modality_rank2(const StageCtx& stage, const QsLevel& qs_next, const ModalityLaunch& ml,
-                               int64_t total_mod_entries) {
+                               int64_t total_mod_entries, bool build_q01, const float* lin_override = nullptr,
+                               int lin_b_stride = 0) {
   NegEfeContext& ctx  = stage.ctx;
   const int      Sd0  = dep_state_size(stage.L, ml.deps, 0);
   const int      Sd1  = dep_state_size(stage.L, ml.deps, 1);
@@ -169,16 +216,32 @@ FfiError launch_modality_rank2(const StageCtx& stage, const QsLevel& qs_next, co
   float* tmp_qo_cb = ctx.scratch.tmp_qo_cublas.as<float>();
   float* tmp_wa_cb = ml.use_pA ? ctx.scratch.tmp_wa_cublas.as<float>() : nullptr;
 
-  PYMDP_TRY(build_q01_outer_for_modality(stage, qs_next, ml, q01_outer));
+  // q01_outer = qs0⊗qs1 depends only on the dependency group (factors + H + S),
+  // not on the modality, so the caller skips the rebuild for a run of modalities
+  // that share a group (build_q01=false reuses the resident buffer).
+  if (build_q01) PYMDP_TRY(build_q01_outer_for_modality(stage, qs_next, ml, q01_outer));
   if (ml.use_states || ml.use_pA) {
     PYMDP_TRY(run_batched_q01_gemm(stage, "rank-2 modality GEMM", q01_outer, ml.A_unflat, tmp_qo_cb, ml.O, H_kk, K_d));
   }
   if (ml.use_pA) {
     PYMDP_TRY(run_batched_q01_gemm(stage, "rank-2 pA GEMM", q01_outer, ml.wA_unflat, tmp_wa_cb, ml.O, H_kk, K_d));
   }
+
+  const float* tmp_lin = lin_override;
+  int          lin_str = lin_b_stride;
+  if (ml.use_linear && lin_override == nullptr) {
+    // Per-modality linear term: GEMM (linear[b,1,K] @ q01_outer[b,K,H_kk] ->
+    // tmp_lin[b,1,H_kk]) so the K_d reduction runs on cuBLAS rather than the
+    // finish kernel's Bn*H_kk-thread serial loop. A group of >=2 modalities
+    // batches this into one GEMM upstream and passes lin_override instead.
+    float* per_mod_lin = ctx.scratch.split_tmp_lin.as<float>();
+    PYMDP_TRY(run_batched_q01_gemm(stage, "rank-2 linear GEMM", q01_outer, ml.linear, per_mod_lin, 1, H_kk, K_d));
+    tmp_lin = per_mod_lin;
+    lin_str = H_kk;
+  }
   CUDA_TRY("modality_score_dedup_rank2_cublas_finish",
            cuda_kernels::launch_modality_score_dedup_rank2_cublas_finish(
-               tmp_qo_cb, tmp_wa_cb, q01_outer, ml.linear, stage.Bn, ml.O, H_kk, K_d, total_mod_entries, ml.use_states,
+               tmp_qo_cb, tmp_wa_cb, tmp_lin, stage.Bn, ml.O, H_kk, lin_str, total_mod_entries, ml.use_states,
                ml.use_linear, ml.use_pA, ml.score_out, stage.stream));
   return FfiError::Success();
 }
@@ -242,10 +305,15 @@ FfiError launch_modality_rank3(const StageCtx& stage, const QsLevel& qs_next, co
   }
 
   if (ml.use_linear) {
-    // cuBLAS sgemm beats the per-(b,h,s) thread-K kernel above ~H_kk=32 on
-    // sm_53 (microbench_modality_subkernels); dispatch overhead loses below.
+    // tmp_lin is a batched GEMM out[h, s2] = sum_k q01[k, h] * linear[k, s2]
+    // (M = H_kk, N = S_split, K = K_keep). Tiny shapes take the warp-per-output
+    // kernel (same lever as the stage-1 GEMM); above H_kk=32 cuBLAS's tiling
+    // pays off; the thread-per-output per_h kernel covers the rest.
     constexpr int kTmpLinCublasMinHkk = 32;
-    if (H_kk >= kTmpLinCublasMinHkk) {
+    if (use_warp_gemm(H_kk, S_split, K_keep)) {
+      CUDA_TRY("tmp_lin_warp", cuda_kernels::launch_tmp_lin_warp(q01_outer, ml.linear, stage.Bn, K_keep, H_kk, S_split,
+                                                                 tmp_lin_buf, stage.stream));
+    } else if (H_kk >= kTmpLinCublasMinHkk) {
       PYMDP_TRY(run_batched_tmp_lin_gemm(stage, q01_outer, ml.linear, tmp_lin_buf, K_keep, H_kk, S_split));
     } else {
       CUDA_TRY("tmp_lin_per_h", cuda_kernels::launch_tmp_lin_per_h(q01_outer, ml.linear, stage.Bn, K_keep, H_kk,
@@ -274,6 +342,8 @@ FfiError launch_b_rollout_level(const StageCtx& stage, int t, const QsLevel& cur
 
   next->ptrs.resize(F);
   next->histories.resize(F);
+  // Factor-score gate is f-invariant — resolve once outside the loop.
+  const bool do_fs = needs_factor_scores(ctx, stage.flags);
   for (int f = 0; f < F; ++f) {
     const int            Sf       = static_cast<int>(L.S[f]);
     const int            Uf       = static_cast<int>(L.U[f]);
@@ -285,7 +355,6 @@ FfiError launch_b_rollout_level(const StageCtx& stage, int t, const QsLevel& cur
     const int32_t*       action_h = factor_action_per_history[t][f].as<const int32_t>();
     const int32_t*       parent_h = factor_parent_history[t][f].as<const int32_t>();
     float*               qs_out   = ctx.scratch.qs_factor_buf[write_slot][f].as<float>();
-    const bool           do_fs    = needs_factor_scores(ctx, stage.flags);
     float*               factor_score =
         do_fs
             ? (ctx.scratch.factor_scores.as<float>() + ctx.tree_cache.ind_score_offsets[static_cast<size_t>(t) * F + f])
@@ -320,24 +389,120 @@ FfiError launch_b_rollout_level(const StageCtx& stage, int t, const QsLevel& cur
   return FfiError::Success();
 }
 
+// Signature identifying a rank-2 q01_outer (= qs0⊗qs1): the two dependency
+// factors and their per-level history/state dims. Two rank-2 modalities with
+// equal signatures at the same level share an identical q01_outer.
+struct Q01Sig {
+  int64_t f0 = -1, f1 = -1;
+  int     H0 = -1, H1 = -1, S0 = -1, S1 = -1;
+  bool    valid = false;
+  bool    operator==(const Q01Sig& o) const {
+    return valid && o.valid && f0 == o.f0 && f1 == o.f1 && H0 == o.H0 && H1 == o.H1 && S0 == o.S0 && S1 == o.S1;
+  }
+};
+
+// Lever #2: gather a run of g consecutive rank-2 modalities sharing one
+// dependency group into stacked_lin_in[Bn, g, K_d] (a cudaMemcpy2DAsync per
+// member handles the b/g/k interleave), then one cuBLAS GEMM against the shared
+// q01_outer writes stacked_lin_out[Bn, g, H_kk]. Replaces g skinny (M_rm=1, big
+// K) per-modality GEMMs — a pathological cuBLAS shape — with one M_rm=g GEMM.
+// q01_outer must already hold this group's signature.
+static FfiError launch_rank2_group_linear(const StageCtx& stage, const std::vector<ModalityLaunch>& mls, int m0, int g,
+                                          int K_d, int H_kk) {
+  NegEfeContext& ctx         = stage.ctx;
+  float*         stacked_in  = ctx.scratch.stacked_lin_in.as<float>();
+  float*         stacked_out = ctx.scratch.stacked_lin_out.as<float>();
+  const size_t   dpitch      = static_cast<size_t>(g) * K_d * sizeof(float);
+  const size_t   rowbytes    = static_cast<size_t>(K_d) * sizeof(float);
+  for (int j = 0; j < g; ++j) {
+    CUDA_TRY("stacked linear gather",
+             cudaMemcpy2DAsync(stacked_in + static_cast<size_t>(j) * K_d, dpitch, mls[m0 + j].linear, rowbytes,
+                               rowbytes, stage.Bn, cudaMemcpyDeviceToDevice, stage.stream));
+  }
+  PYMDP_TRY(run_batched_q01_gemm(stage, "rank-2 group linear GEMM", ctx.scratch.q01_outer.as<float>(), stacked_in,
+                                 stacked_out, g, H_kk, K_d));
+  return FfiError::Success();
+}
+
 FfiError launch_modality_scores(const StageCtx& stage, int t, const QsLevel& qs_next) {
   const int     M                 = static_cast<int>(stage.L.M);
   const int64_t total_mod_entries = stage.ctx.tree_cache.total_mod_entries;
+
+  // Per-modality launches + rank-2 dependency-group signatures (for grouping)
+  // and tiny-path verdicts (tiny depends on O, which can vary within a group).
+  std::vector<ModalityLaunch> mls;
+  mls.reserve(M);
+  std::vector<Q01Sig> sigs(M);
+  std::vector<char>   tiny(M, 0);
   for (int m = 0; m < M; ++m) {
-    const ModalityLaunch ml = make_modality_launch(stage, t, m);
+    mls.push_back(make_modality_launch(stage, t, m));
+    const ModalityLaunch& ml = mls[m];
+    if (ml.deps.rank == 2) {
+      sigs[m] = Q01Sig{ml.deps.factors[0],
+                       ml.deps.factors[1],
+                       ml.H[0],
+                       ml.H[1],
+                       dep_state_size(stage.L, ml.deps, 0),
+                       dep_state_size(stage.L, ml.deps, 1),
+                       true};
+      tiny[m] = use_tiny_fused_modality_path(ml, stage.Bn, sigs[m].H0 * sigs[m].H1, sigs[m].S0 * sigs[m].S1) ? 1 : 0;
+    }
+  }
+
+  Q01Sig last{};  // signature currently resident in q01_outer (lever #1 memo)
+  int    m = 0;
+  while (m < M) {
+    const ModalityLaunch& ml = mls[m];
+
+    // Lever #2: batch the linear term across a run of same-group non-tiny
+    // rank-2 modalities into one GEMM. Only when use_linear (the term exists).
+    if (ml.deps.rank == 2 && !tiny[m] && ml.use_linear) {
+      int g = 1;
+      while (m + g < M && mls[m + g].deps.rank == 2 && !tiny[m + g] && (sigs[m + g] == sigs[m])) ++g;
+      if (g >= 2) {
+        const int K_d  = sigs[m].S0 * sigs[m].S1;
+        const int H_kk = sigs[m].H0 * sigs[m].H1;
+        // Lever #1: build the shared q01_outer once for the whole group.
+        PYMDP_TRY(build_q01_outer_for_modality(stage, qs_next, ml, stage.ctx.scratch.q01_outer.as<float>()));
+        // Lever #2: batch the linear term into one GEMM across the group. (The
+        // A-term GEMM stays per-modality: batching it loses — its output is
+        // N=H_kk=16, so a stacked GEMM only wastes wider tiles, and re-gathering
+        // the large A every call costs more than it saves.)
+        PYMDP_TRY(launch_rank2_group_linear(stage, mls, m, g, K_d, H_kk));
+        const float* lin_out = stage.ctx.scratch.stacked_lin_out.as<float>();
+        for (int j = 0; j < g; ++j) {
+          PYMDP_TRY(launch_modality_rank2(stage, qs_next, mls[m + j], total_mod_entries, /*build_q01=*/false,
+                                          /*lin_override=*/lin_out + static_cast<size_t>(j) * H_kk,
+                                          /*lin_b_stride=*/g * H_kk));
+        }
+        last = sigs[m];  // q01_outer now holds this group's signature
+        m += g;
+        continue;
+      }
+    }
+
     switch (ml.deps.rank) {
     case 1:
       PYMDP_TRY(launch_modality_rank1(stage, qs_next, ml, total_mod_entries));
+      last = Q01Sig{};
       break;
-    case 2:
-      PYMDP_TRY(launch_modality_rank2(stage, qs_next, ml, total_mod_entries));
+    case 2: {
+      // Lever #1 single-path memo: reuse q01_outer when this rank-2 modality
+      // shares the resident signature (covers the use_linear==false case that
+      // the group path above skips).
+      const bool reuse = !tiny[m] && (sigs[m] == last);
+      PYMDP_TRY(launch_modality_rank2(stage, qs_next, ml, total_mod_entries, /*build_q01=*/!reuse));
+      last = tiny[m] ? Q01Sig{} : sigs[m];
       break;
+    }
     case 3:
       PYMDP_TRY(launch_modality_rank3(stage, qs_next, ml, m, total_mod_entries));
+      last = Q01Sig{};
       break;
     default:
       return invalid_arg(kEfeKernelName, "CUDA path supports modality rank in [1, 3]");
     }
+    ++m;
   }
   return FfiError::Success();
 }

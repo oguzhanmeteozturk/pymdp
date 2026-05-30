@@ -143,6 +143,21 @@ struct CuPool {
     used += n_bytes;
     return view;
   }
+
+  // Reserve an aligned `n_bytes` slot and return a non-owning view into the
+  // backing without copying — the caller fills it (e.g. a D2D cudaMemcpy2DAsync
+  // or a device kernel writing straight into the managed pool). Same alignment
+  // and bump-pointer accounting as append_copy, so reserved and copied slots
+  // can be interleaved within one pool.
+  CuArr append_reserve(size_t n_bytes) {
+    constexpr size_t kAlign = 8;
+    used                    = (used + (kAlign - 1)) & ~(kAlign - 1);
+    if (n_bytes == 0) return CuArr{};
+    char* dst  = static_cast<char*>(backing.ptr) + used;
+    CuArr view = CuArr::view(dst, n_bytes);
+    used += n_bytes;
+    return view;
+  }
 };
 
 }  // namespace pymdp_ffi

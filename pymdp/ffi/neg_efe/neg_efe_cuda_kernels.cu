@@ -1,40 +1,12 @@
-// Device kernels and host launch wrappers for the CUDA neg-EFE path.
-// neg_efe_cuda_{entry,runtime,launch,cache}.cc own the XLA FFI boundary;
-// this TU compiles under nvcc and avoids XLA FFI headers (CUDA 10.2's
-// nvcc cannot parse them).
-// Supported targets: Maxwell sm_53 through Ampere sm_87; warp-shuffle paths
-// gate on __CUDA_ARCH__ for ITS-safety on Volta+.
-//
-// Pipeline
-// --------
-// * B-rollout (per-(t, f)): gather qs from the prior level's per-factor
-//   buffer via parent_history, contract against B. Output sized by H_f^t.
-//   When wB is supplied (param-info-gain) the same block also reduces a
-//   factor_score; when v_full is supplied (use_inductive), an inductive
-//   score the same way.
-// * Modality scoring (per-(t, m)): over the dep factors' Cartesian history
-//   product, not the joint node space.
-//     - Rank 1: one thread per (b, h).
-//     - Rank 2/3 small: fused-tiny kernel inlines the s-Kronecker per (b, h).
-//     - Rank 2 large: q01_outer → cuBLAS GEMM → finish kernel.
-//     - Rank 3 large: split off deps[rank-1]. Stage 1 builds q01_outer + tmp
-//       tensors; stage 2 folds in entropy + linear.
-//   deps order is the caller's A_dependencies order — same indexing in every
-//   consumer, not a correctness contract. For best rank-3 perf put the
-//   largest-history / smallest-state factor last (S_split sizes the
-//   tmp buffers).
-// * Linear: -HA + sum_o A[o,k]*C[o] is precomputed per-(t, m, b, k) so
-//   utility + static entropy correction land in one K-pass dot. The dynamic
-//   xlogx(qo) entropy stays at runtime.
-// * Outputs: scores_concat (per-(t, m) modality), inductive_concat and
-//   factor_scores (both per-(t, f)). Final scatter combines all three via
-//   per-policy history-tuple lookups.
+// Device kernels for CUDA neg-EFE: B-rollout, modality scoring (rank 1/2/3),
+// inductive v_full, final scatter, and content-tag gather. Compiled by nvcc.
+// Supported: Maxwell sm_53–Ampere sm_87; warp-shuffle gates on __CUDA_ARCH__.
 
 #include "neg_efe/neg_efe_cuda_kernels.h"
 
 #include <cstdint>
 
-#include "common/content_tag_index.h"  // content_tag_stride_index, kContentTag* constants
+#include "common/cuda_warp_reduce.h"
 
 namespace pymdp_ffi {
 namespace cuda_kernels {
@@ -43,13 +15,8 @@ namespace cuda_kernels {
 // Common helpers
 // -----------------------------------------------------------------------------
 
-// Block-size tiering. Maxwell sm_53 keeps the original 128; sm_87 gets 256
-// for 1-D scoring + scatter kernels, where one-thread-per-
-// output with short serial loops benefits from the additional latency
-// hiding the bigger SM scheduler offers. B-rollout stays at 128 on both —
-// it uses dynamic shared memory + per-block reductions whose unroll
-// schedules were tuned around that block size; widening would require a
-// different reduction tree.
+// Block-size tuning: sm_87 gets 256 for 1-D scoring (latency hiding); 128 elsewhere.
+// B-rollout stays at 128 (shmem + reduction schedules tuned to it).
 constexpr int kBlockSizeDefault  = 128;
 constexpr int kBlockSizeAmpere1D = 256;
 constexpr int kBRolloutBlockSize = 128;
@@ -65,10 +32,7 @@ inline int launch_blocks(int64_t total, int block_size = kBlockSizeDefault) {
   return static_cast<int>(idiv_ceil64(total, static_cast<int64_t>(block_size)));
 }
 
-// Cached compute-capability lookup. cudaGetDeviceProperties is ~milliseconds
-// the first time; thread_local cache means the cost amortizes to one query
-// per worker thread for the process lifetime. Returns 0 on error so callers
-// fall back to kBlockSizeDefault rather than masquerading as a newer arch.
+// Cached compute-capability lookup (thread_local); returns 0 on error.
 inline int device_cc_cached() {
   thread_local int cc = -1;
   if (cc < 0) {
@@ -83,12 +47,7 @@ inline int device_cc_cached() {
   return cc;
 }
 
-// 1-D scoring/scatter kernels: 256 on sm_87+ when total work warrants it,
-// else 128. Tiny shapes (e.g. agent_step Bn*P=96) leave a 256-block mostly
-// empty and lose to a narrower block the scheduler can ping faster; the
-// threshold ensures ~8 full 256-blocks before switching up.
-//
-// Stream arg is unused today but kept for a future per-stream multi-device path.
+// Use 256 threads on sm_87+ only when total >= 2048 (else waste; scheduler ping faster on 128).
 constexpr int64_t kAmpereWideMinTotal = 2048;
 
 inline int launch_block_size_1d(cudaStream_t /*stream*/, int64_t total) {
@@ -96,18 +55,8 @@ inline int launch_block_size_1d(cudaStream_t /*stream*/, int64_t total) {
   return (total >= kAmpereWideMinTotal) ? kBlockSizeAmpere1D : kBlockSizeDefault;
 }
 
-// 1-D grid launch macro. `total` must already be int64 at the call site —
-// int32 products like `Bn * H_0 * H_1 * H_d` overflow silently and
-// short-circuit the empty-grid guard as "success".
-//
-// Block size is selected via launch_block_size_1d(stream) — 256 on sm_87+,
-// 128 elsewhere. The body must reference `pymdp_block_size` (not the now-
-// removed `kBlockSize` constant) in its <<<..., pymdp_block_size, ...>>>
-// launch-config and the enclosing function must expose a `stream` symbol.
-//
-// IMPORTANT: this macro `return`s from the enclosing function (cudaSuccess
-// on empty grid, else cudaGetLastError() after launch), so it must be the
-// terminal statement of a cudaError_t-returning launcher.
+// 1-D grid launcher macro. Guard empty grid, compute blocks, call kernel with pymdp_block_size.
+// Must be terminal statement in a cudaError_t-returning function; returns cudaGetLastError().
 #define PYMDP_LAUNCH_1D(total, ...)                                                                                    \
   do {                                                                                                                 \
     const int64_t pymdp_launch_total = (total);                                                                        \
@@ -194,17 +143,32 @@ inline int launch_block_size_1d(cudaStream_t /*stream*/, int64_t total) {
     if (pymdp_total <= 0) return cudaSuccess;                                                                          \
     const int pymdp_block_size = launch_block_size_1d(stream, pymdp_total);                                            \
     const int pymdp_blocks     = launch_blocks(pymdp_total, pymdp_block_size);                                         \
-    const int pymdp_b3 =                                                                                               \
-        (static_cast<int>(use_s) << 2) | (static_cast<int>(use_l) << 1) | static_cast<int>(use_p);                     \
+    const int pymdp_b3 = (static_cast<int>(use_s) << 2) | (static_cast<int>(use_l) << 1) | static_cast<int>(use_p);    \
     switch (pymdp_b3) {                                                                                                \
-    case 0: kernel<false, false, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
-    case 1: kernel<false, false, true ><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
-    case 2: kernel<false, true , false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
-    case 3: kernel<false, true , true ><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
-    case 4: kernel<true , false, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
-    case 5: kernel<true , false, true ><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
-    case 6: kernel<true , true , false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
-    case 7: kernel<true , true , true ><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;            \
+    case 0:                                                                                                            \
+      kernel<false, false, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                         \
+      break;                                                                                                           \
+    case 1:                                                                                                            \
+      kernel<false, false, true><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                          \
+      break;                                                                                                           \
+    case 2:                                                                                                            \
+      kernel<false, true, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                          \
+      break;                                                                                                           \
+    case 3:                                                                                                            \
+      kernel<false, true, true><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                           \
+      break;                                                                                                           \
+    case 4:                                                                                                            \
+      kernel<true, false, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                          \
+      break;                                                                                                           \
+    case 5:                                                                                                            \
+      kernel<true, false, true><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                           \
+      break;                                                                                                           \
+    case 6:                                                                                                            \
+      kernel<true, true, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                           \
+      break;                                                                                                           \
+    case 7:                                                                                                            \
+      kernel<true, true, true><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                            \
+      break;                                                                                                           \
     }                                                                                                                  \
     return cudaGetLastError();                                                                                         \
   } while (0)
@@ -218,10 +182,18 @@ inline int launch_block_size_1d(cudaStream_t /*stream*/, int64_t total) {
     const int pymdp_blocks     = launch_blocks(pymdp_total, pymdp_block_size);                                         \
     const int pymdp_b2         = (static_cast<int>(use_a) << 1) | static_cast<int>(use_b);                             \
     switch (pymdp_b2) {                                                                                                \
-    case 0: kernel<false, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;                   \
-    case 1: kernel<false, true ><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;                   \
-    case 2: kernel<true , false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;                   \
-    case 3: kernel<true , true ><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__); break;                   \
+    case 0:                                                                                                            \
+      kernel<false, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                                \
+      break;                                                                                                           \
+    case 1:                                                                                                            \
+      kernel<false, true><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                                 \
+      break;                                                                                                           \
+    case 2:                                                                                                            \
+      kernel<true, false><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                                 \
+      break;                                                                                                           \
+    case 3:                                                                                                            \
+      kernel<true, true><<<pymdp_blocks, pymdp_block_size, 0, stream>>>(__VA_ARGS__);                                  \
+      break;                                                                                                           \
     }                                                                                                                  \
     return cudaGetLastError();                                                                                         \
   } while (0)
@@ -234,8 +206,9 @@ inline int launch_block_size_1d(cudaStream_t /*stream*/, int64_t total) {
 // K_f = prod_i parents.S[i]; k decomposes (s_0, ..., s_{N-1}) row-major.
 // One block per (b, h_next); shmem holds qs_outer[K_f].
 //
-// Shmem ceiling: K_f * 4B per block. sm_53 has 48 KB/SM so K_f <= 12288;
-// larger trips cudaErrorInvalidConfiguration (chunk the K loop).
+// Shmem: dynamic, K_f * 4B per block. configure_b_rollout_for_arch raises the
+// per-launch ceiling to the arch max (48 KB on sm_53 -> K_f <= 12288; up to
+// ~164 KB on sm_87); K_f beyond the arch max trips cudaErrorInvalidConfiguration.
 //
 // N_PARENTS specialization is compile-time: N in {1,2,3} hoists per-parent
 // qs/H/S into named __restrict__ locals; N >= 4 takes an indexed Kronecker
@@ -248,40 +221,13 @@ __device__ __forceinline__ const float* parent_qs_base(const BRolloutParents& p,
   return p.qs[i] + (static_cast<size_t>(b) * p.H[i] + parent_h_i) * p.S[i];
 }
 
-// Warp-shuffle sum over the 32 lanes of warp 0. Pre-Volta uses legacy
-// __shfl_xor; Volta+ requires the _sync variant for ITS correctness.
-// Precondition: all 32 lanes enter uniformly (the `if (tid < 32)` guard
-// at the call site).
-__device__ __forceinline__ float warp0_shfl_sum(float v) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
-  v += __shfl_xor_sync(0xffffffffu, v, 16);
-  v += __shfl_xor_sync(0xffffffffu, v, 8);
-  v += __shfl_xor_sync(0xffffffffu, v, 4);
-  v += __shfl_xor_sync(0xffffffffu, v, 2);
-  v += __shfl_xor_sync(0xffffffffu, v, 1);
-#else
-  v += __shfl_xor(v, 16);
-  v += __shfl_xor(v, 8);
-  v += __shfl_xor(v, 4);
-  v += __shfl_xor(v, 2);
-  v += __shfl_xor(v, 1);
-#endif
-  return v;
-}
-
-// Warp-wide argmax: each lane brings (val, idx); all lanes converge on the
-// pair with maximum val. Ties broken by smaller idx so the result is
-// deterministic across runs.
+// Warp-wide argmax: each lane brings (val, idx); all lanes converge on maximum.
+// Ties broken by smaller idx (deterministic across runs).
 __device__ __forceinline__ void warp_reduce_argmax(float& val, int& idx) {
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
     const float other_val = __shfl_xor_sync(0xffffffffu, val, off);
     const int   other_idx = __shfl_xor_sync(0xffffffffu, idx, off);
-#else
-    const float other_val = __shfl_xor(val, off);
-    const int   other_idx = __shfl_xor(idx, off);
-#endif
     if (other_val > val || (other_val == val && other_idx < idx)) {
       val = other_val;
       idx = other_idx;
@@ -289,102 +235,14 @@ __device__ __forceinline__ void warp_reduce_argmax(float& val, int& idx) {
   }
 }
 
-// Block-wide sum, parameterized on BLOCK_SIZE. Warp-leader pattern: each warp
-// reduces internally via shuffle (no shmem), warp leaders publish to a
-// per-warp shmem slot, single __syncthreads, then warp 0 shuffles across
-// the warp-leader slots. ONE barrier per call vs. the prior tree's 2-3 at
-// BLOCK_SIZE >= 128 — the dominant cost in B-rollout's profile was
-// __syncthreads in this reducer. Shmem footprint drops from BLOCK_SIZE
-// floats to BLOCK_SIZE/32 floats.
-//
-// CONTRACT — read before adding a caller:
-//   1. The return value is valid **only on lane 0** (threadIdx.x == 0). The
-//      `_lane0` suffix flags this at every call site. If you need the value
-//      broadcast to all threads, publish it yourself through shmem + a
-//      barrier.
-//   2. The static __shared__ `buf` is aliased across inlined call sites.
-//      Back-to-back invocations race on `buf` (warp 0 from call #1 still
-//      reading buf[0..num_warps-1] while warp leaders overwrite it for
-//      call #2). Callers that invoke this helper twice in a row must place
-//      a __syncthreads() between the calls — or use the pair variant below
-//      to fuse two reductions into one barrier.
-template <int BLOCK_SIZE>
-__device__ __forceinline__ float block_reduce_sum_lane0(float val) {
-  static_assert(BLOCK_SIZE % 32 == 0, "BLOCK_SIZE must be a multiple of warp size");
-  constexpr int NUM_WARPS = BLOCK_SIZE / 32;
-  __shared__ float buf[NUM_WARPS];
+// block_reduce_sum_lane0, block_reduce_sum_pair_lane0 hoisted to common/cuda_warp_reduce.h
 
-  // Intra-warp reduction via XOR butterfly. After this, lane 0 of each warp
-  // holds that warp's partial sum.
-  val = warp0_shfl_sum(val);
-
-  const int tid  = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-
-  if (lane == 0) buf[warp] = val;
-  __syncthreads();
-
-  // Warp 0 reduces the NUM_WARPS partials. Lanes past NUM_WARPS contribute
-  // identity (0); the XOR butterfly converges on lane 0 in log2(32) steps.
-  float v = 0.0f;
-  if (warp == 0) {
-    v = (lane < NUM_WARPS) ? buf[lane] : 0.0f;
-    v = warp0_shfl_sum(v);
-  }
-  return v;  // Valid only on lane 0 — see contract above.
-}
-
-// Fused two-reduction variant. Reduces a pair (a, b) using a single
-// __syncthreads instead of three (sync + reduce, sync between calls, sync +
-// reduce). Used by B-rollout when both COMPUTE_WB and COMPUTE_INDUCTIVE are
-// live so the per-block factor_score + ind_score pair publishes with one
-// barrier rather than the back-to-back calls that the buf-aliasing contract
-// of the single-value helper would otherwise force.
-//
-// Same contract: results are valid on lane 0 only.
-template <int BLOCK_SIZE>
-__device__ __forceinline__ void block_reduce_sum_pair_lane0(float& a, float& b) {
-  static_assert(BLOCK_SIZE % 32 == 0, "BLOCK_SIZE must be a multiple of warp size");
-  constexpr int NUM_WARPS = BLOCK_SIZE / 32;
-  __shared__ float buf_a[NUM_WARPS];
-  __shared__ float buf_b[NUM_WARPS];
-
-  a = warp0_shfl_sum(a);
-  b = warp0_shfl_sum(b);
-
-  const int tid  = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-
-  if (lane == 0) {
-    buf_a[warp] = a;
-    buf_b[warp] = b;
-  }
-  __syncthreads();
-
-  if (warp == 0) {
-    float va = (lane < NUM_WARPS) ? buf_a[lane] : 0.0f;
-    float vb = (lane < NUM_WARPS) ? buf_b[lane] : 0.0f;
-    va       = warp0_shfl_sum(va);
-    vb       = warp0_shfl_sum(vb);
-    a        = va;
-    b        = vb;
-  }
-}
-
-// Phase 2 of B-rollout (per-s dot against B → qs_out), optionally fused with
-//   factor_score = sum_s (qs_out[s] * sum_k wB[s,k] * qs_outer[k])         (wB)
-//   ind_score    = sum_s (qs_out[s] * v_full_b[s])                  (inductive)
-// Both reductions share the per-block reduce. COMPUTE_WB / COMPUTE_INDUCTIVE
-// are template params so the no-reduction instantiation DCEs the reduce
-// buffer and partial registers.
 template <int BLOCK_SIZE, bool COMPUTE_WB, bool COMPUTE_INDUCTIVE>
-__device__ __forceinline__ void
-b_rollout_phase2_and_wb(const float* __restrict__ B, const float* __restrict__ wB_tr,
-                        const float* __restrict__ v_full_b, int b, int h, int u, int Nh, int S_f, int K_f, int U_f,
-                        const float* __restrict__ qs_outer, float* __restrict__ qs_out,
-                        float* __restrict__ factor_score, float* __restrict__ ind_score_t_f, int64_t ind_b_stride) {
+__device__ __forceinline__ void b_rollout_phase2_and_wb(const float* __restrict__ B, const float* __restrict__ wB_tr,
+                                                        const float* __restrict__ v_full_b, int b, int h, int u, int Nh,
+                                                        int S_f, int K_f, int U_f, const float* __restrict__ qs_outer,
+                                                        float* __restrict__ qs_out, float* __restrict__ factor_score,
+                                                        float* __restrict__ ind_score_t_f, int64_t ind_b_stride) {
   // Per-block bases hoisted in size_t; inner loops then run int32.
   const int    row_stride_B = K_f * U_f;
   const float* B_b          = B + static_cast<size_t>(b) * S_f * row_stride_B;
@@ -441,13 +299,12 @@ b_rollout_phase2_and_wb(const float* __restrict__ B, const float* __restrict__ w
 }
 
 template <int BLOCK_SIZE, int N_PARENTS, bool COMPUTE_WB, bool COMPUTE_INDUCTIVE>
-__global__ void b_rollout_general_kernel(const float* __restrict__ B, const float* __restrict__ wB_tr,
-                                         const float* __restrict__ v_full, int qs_flat, int qs_off_f,
-                                         const int32_t* __restrict__ action_h,
-                                         const int32_t* __restrict__ parent_histories, BRolloutParents parents, int Bn,
-                                         int Nh, int S_f, int K_f, int U_f, float* __restrict__ qs_out,
-                                         float* __restrict__ factor_score, float* __restrict__ ind_score_t_f,
-                                         int64_t ind_b_stride) {
+__global__ void
+b_rollout_general_kernel(const float* __restrict__ B, const float* __restrict__ wB_tr, const float* __restrict__ v_full,
+                         int qs_flat, int qs_off_f, const int32_t* __restrict__ action_h,
+                         const int32_t* __restrict__ parent_histories, BRolloutParents parents, int Bn, int Nh, int S_f,
+                         int K_f, int U_f, float* __restrict__ qs_out, float* __restrict__ factor_score,
+                         float* __restrict__ ind_score_t_f, int64_t ind_b_stride) {
   const int b = blockIdx.x;
   const int h = blockIdx.y;
   if (b >= Bn || h >= Nh) return;
@@ -462,7 +319,7 @@ __global__ void b_rollout_general_kernel(const float* __restrict__ B, const floa
     const float* __restrict__ qs0_bh = parent_qs_base(parents, 0, b, parent_histories[h]);
     for (int k = threadIdx.x; k < K_f; k += blockDim.x) qs_outer[k] = qs0_bh[k];
   } else if (N_PARENTS == 2) {
-    const int                 S1     = parents.S[1];
+    const int S1                     = parents.S[1];
     const float* __restrict__ qs0_bh = parent_qs_base(parents, 0, b, parent_histories[h * 2 + 0]);
     const float* __restrict__ qs1_bh = parent_qs_base(parents, 1, b, parent_histories[h * 2 + 1]);
     for (int k = threadIdx.x; k < K_f; k += blockDim.x) {
@@ -471,9 +328,9 @@ __global__ void b_rollout_general_kernel(const float* __restrict__ B, const floa
       qs_outer[k]   = qs0_bh[s_0] * qs1_bh[s_1];
     }
   } else if (N_PARENTS == 3) {
-    const int                 S1     = parents.S[1];
-    const int                 S2     = parents.S[2];
-    const int                 S_12   = S1 * S2;
+    const int S1                     = parents.S[1];
+    const int S2                     = parents.S[2];
+    const int S_12                   = S1 * S2;
     const float* __restrict__ qs0_bh = parent_qs_base(parents, 0, b, parent_histories[h * 3 + 0]);
     const float* __restrict__ qs1_bh = parent_qs_base(parents, 1, b, parent_histories[h * 3 + 1]);
     const float* __restrict__ qs2_bh = parent_qs_base(parents, 2, b, parent_histories[h * 3 + 2]);
@@ -508,11 +365,9 @@ __global__ void b_rollout_general_kernel(const float* __restrict__ B, const floa
   }
   __syncthreads();
 
-  const float* v_full_b =
-      COMPUTE_INDUCTIVE ? (v_full + static_cast<size_t>(b) * qs_flat + qs_off_f) : nullptr;
-  b_rollout_phase2_and_wb<BLOCK_SIZE, COMPUTE_WB, COMPUTE_INDUCTIVE>(B, wB_tr, v_full_b, b, h, u, Nh, S_f, K_f, U_f,
-                                                                    qs_outer, qs_out, factor_score, ind_score_t_f,
-                                                                    ind_b_stride);
+  const float* v_full_b = COMPUTE_INDUCTIVE ? (v_full + static_cast<size_t>(b) * qs_flat + qs_off_f) : nullptr;
+  b_rollout_phase2_and_wb<BLOCK_SIZE, COMPUTE_WB, COMPUTE_INDUCTIVE>(
+      B, wB_tr, v_full_b, b, h, u, Nh, S_f, K_f, U_f, qs_outer, qs_out, factor_score, ind_score_t_f, ind_b_stride);
 }
 
 namespace {
@@ -540,7 +395,7 @@ inline cudaError_t configure_b_rollout_for_arch(size_t shmem_bytes) {
   if (shmem_bytes <= 48u * 1024u) return cudaSuccess;
   thread_local size_t configured_max = 0;
   if (shmem_bytes <= configured_max) return cudaSuccess;
-  auto kernel = b_rollout_general_kernel<BLOCK_SIZE, N_PARENTS, COMPUTE_WB, COMPUTE_INDUCTIVE>;
+  auto               kernel = b_rollout_general_kernel<BLOCK_SIZE, N_PARENTS, COMPUTE_WB, COMPUTE_INDUCTIVE>;
   cudaFuncAttributes attr{};
   cudaError_t        err = cudaFuncGetAttributes(&attr, kernel);
   if (err != cudaSuccess) return err;
@@ -558,14 +413,14 @@ template <int N_PARENTS, bool COMPUTE_WB, bool COMPUTE_INDUCTIVE>
 inline cudaError_t launch_b_rollout_tpl(const float* B, const float* wB_tr, const float* v_full, int qs_flat,
                                         int qs_off_f, const int32_t* action_h, const int32_t* parent_histories,
                                         BRolloutParents parents, int Bn, int Nh, int S_f, int K_f, int U_f,
-                                        float* qs_out, float* factor_score, float* ind_score_t_f,
-                                        int64_t ind_b_stride, cudaStream_t stream) {
+                                        float* qs_out, float* factor_score, float* ind_score_t_f, int64_t ind_b_stride,
+                                        cudaStream_t stream) {
   // dim3(0, ...) trips cudaErrorInvalidConfiguration on some drivers.
   if (Bn <= 0 || Nh <= 0) return cudaSuccess;
   const dim3   grid(static_cast<unsigned>(Bn), static_cast<unsigned>(Nh), 1);
   const size_t shmem_bytes = static_cast<size_t>(K_f) * sizeof(float);
-  cudaError_t  err         = configure_b_rollout_for_arch<kBRolloutBlockSize, N_PARENTS, COMPUTE_WB,
-                                                          COMPUTE_INDUCTIVE>(shmem_bytes);
+  cudaError_t  err =
+      configure_b_rollout_for_arch<kBRolloutBlockSize, N_PARENTS, COMPUTE_WB, COMPUTE_INDUCTIVE>(shmem_bytes);
   if (err != cudaSuccess) return err;
   b_rollout_general_kernel<kBRolloutBlockSize, N_PARENTS, COMPUTE_WB, COMPUTE_INDUCTIVE>
       <<<grid, kBRolloutBlockSize, shmem_bytes, stream>>>(B, wB_tr, v_full, qs_flat, qs_off_f, action_h,
@@ -593,9 +448,9 @@ cudaError_t launch_b_rollout_general(const float* B, const float* wB_tr, const f
   // post-dispatch cudaGetLastError(), which would only catch launch errors.
   cudaError_t pymdp_br_rc = cudaSuccess;
 #define LAUNCH_B_ROLLOUT_BOOL(W, I)                                                                                    \
-  pymdp_br_rc = launch_b_rollout_tpl<PYMDP_BR_N_VAL, W, I>(                                                            \
-      B, wB_tr, v_full, qs_flat, qs_off_f, action_h, parent_histories, parents, Bn, Nh, S_f, K_f, U_f, qs_out,         \
-      factor_score, ind_score_t_f, ind_b_stride, stream)
+  pymdp_br_rc = launch_b_rollout_tpl<PYMDP_BR_N_VAL, W, I>(B, wB_tr, v_full, qs_flat, qs_off_f, action_h,              \
+                                                           parent_histories, parents, Bn, Nh, S_f, K_f, U_f, qs_out,   \
+                                                           factor_score, ind_score_t_f, ind_b_stride, stream)
 #define LAUNCH_B_ROLLOUT(N)                                                                                            \
   case N: {                                                                                                            \
     constexpr int PYMDP_BR_N_VAL = N;                                                                                  \
@@ -682,8 +537,8 @@ cudaError_t launch_modality_score_dedup_rank1(const float* A_unflat, const float
                                               int64_t b_stride, bool use_states, bool use_linear, bool use_pA,
                                               float* score_out, cudaStream_t stream) {
   PYMDP_LAUNCH_BOOL3_1D(static_cast<int64_t>(Bn) * H_d_0, use_states, use_linear, use_pA,
-                        modality_score_dedup_rank1_kernel,
-                        A_unflat, wA_unflat, linear, qs_d_0, Bn, O, H_d_0, S_d_0, b_stride, score_out);
+                        modality_score_dedup_rank1_kernel, A_unflat, wA_unflat, linear, qs_d_0, Bn, O, H_d_0, S_d_0,
+                        b_stride, score_out);
 }
 
 // -----------------------------------------------------------------------------
@@ -763,9 +618,8 @@ cudaError_t launch_modality_score_dedup_rank2_fused_tiny(const float* A_unflat, 
                                                          int64_t b_stride, bool use_states, bool use_linear,
                                                          bool use_pA, float* score_out, cudaStream_t stream) {
   PYMDP_LAUNCH_BOOL3_1D(static_cast<int64_t>(Bn) * H_d_0 * H_d_1, use_states, use_linear, use_pA,
-                        modality_score_dedup_rank2_fused_tiny_kernel,
-                        A_unflat, wA_unflat, linear, qs_d_0, qs_d_1, Bn, O, H_d_0, H_d_1, S_d_0, S_d_1, b_stride,
-                        score_out);
+                        modality_score_dedup_rank2_fused_tiny_kernel, A_unflat, wA_unflat, linear, qs_d_0, qs_d_1, Bn,
+                        O, H_d_0, H_d_1, S_d_0, S_d_1, b_stride, score_out);
 }
 
 template <bool USE_STATES, bool USE_LINEAR, bool USE_PA>
@@ -781,12 +635,12 @@ __global__ void modality_score_dedup_rank3_fused_tiny_kernel(
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total) return;
 
-  const int     b    = static_cast<int>(idx / H_all);
-  int64_t       rest = idx - static_cast<int64_t>(b) * H_all;
-  const int     h0   = static_cast<int>(rest / H_12);
+  const int b    = static_cast<int>(idx / H_all);
+  int64_t   rest = idx - static_cast<int64_t>(b) * H_all;
+  const int h0   = static_cast<int>(rest / H_12);
   rest -= static_cast<int64_t>(h0) * H_12;
-  const int     h1 = static_cast<int>(rest / H_d_2);
-  const int     h2 = static_cast<int>(rest - static_cast<int64_t>(h1) * H_d_2);
+  const int h1 = static_cast<int>(rest / H_d_2);
+  const int h2 = static_cast<int>(rest - static_cast<int64_t>(h1) * H_d_2);
 
   const float* qs0 = qs_d_0 + (b * H_d_0 + h0) * S_d_0;
   const float* qs1 = qs_d_1 + (b * H_d_1 + h1) * S_d_1;
@@ -851,16 +705,16 @@ cudaError_t launch_modality_score_dedup_rank3_fused_tiny(const float* A_unflat, 
                                                          bool use_states, bool use_linear, bool use_pA,
                                                          float* score_out, cudaStream_t stream) {
   PYMDP_LAUNCH_BOOL3_1D(static_cast<int64_t>(Bn) * H_d_0 * H_d_1 * H_d_2, use_states, use_linear, use_pA,
-                        modality_score_dedup_rank3_fused_tiny_kernel,
-                        A_unflat, wA_unflat, linear, qs_d_0, qs_d_1, qs_d_2, Bn, O, H_d_0, H_d_1, H_d_2, S_d_0, S_d_1,
-                        S_d_2, b_stride, score_out);
+                        modality_score_dedup_rank3_fused_tiny_kernel, A_unflat, wA_unflat, linear, qs_d_0, qs_d_1,
+                        qs_d_2, Bn, O, H_d_0, H_d_1, H_d_2, S_d_0, S_d_1, S_d_2, b_stride, score_out);
 }
 
 // -----------------------------------------------------------------------------
 // cuBLAS helper kernels (rank-2 / rank-3 modality). .cc launches them around
 // cublasSgemmStridedBatched. Rank-3 stage 1 = build_qs01_outer → GEMM →
 // tmp_qo_cublas_to_my → tmp_lin_per_h; rank-3 stage 2 (below) folds entropy
-// + linear. Rank-2 reuses build_qs01_outer + GEMM, finishes via
+// + linear. Rank-2 reuses build_qs01_outer + an A GEMM (+ a second GEMM for
+// the linear term, linear @ q01_outer → tmp_lin), finishing via
 // modality_score_dedup_rank2_cublas_finish_kernel below.
 // -----------------------------------------------------------------------------
 
@@ -875,14 +729,14 @@ __global__ void build_qs01_outer_kernel(const float* __restrict__ qs_keep_0, con
   const int64_t total  = static_cast<int64_t>(Bn) * per_b;
   if (idx >= total) return;
 
-  const int     b   = static_cast<int>(idx / per_b);
-  int64_t       r   = idx - static_cast<int64_t>(b) * per_b;
-  const int     k   = static_cast<int>(r / H_kk);
-  const int     h   = static_cast<int>(r - static_cast<int64_t>(k) * H_kk);
-  const int     s_0 = k / S_1;
-  const int     s_1 = k - s_0 * S_1;
-  const int     h_0 = h / H_1;
-  const int     h_1 = h - h_0 * H_1;
+  const int b   = static_cast<int>(idx / per_b);
+  int64_t   r   = idx - static_cast<int64_t>(b) * per_b;
+  const int k   = static_cast<int>(r / H_kk);
+  const int h   = static_cast<int>(r - static_cast<int64_t>(k) * H_kk);
+  const int s_0 = k / S_1;
+  const int s_1 = k - s_0 * S_1;
+  const int h_0 = h / H_1;
+  const int h_1 = h - h_0 * H_1;
 
   const float qs0 = qs_keep_0[(static_cast<int64_t>(b) * H_0 + h_0) * S_0 + s_0];
   const float qs1 = qs_keep_1[(static_cast<int64_t>(b) * H_1 + h_1) * S_1 + s_1];
@@ -896,6 +750,44 @@ cudaError_t launch_build_qs01_outer(const float* qs_keep_0, const float* qs_keep
                       qs_keep_0, qs_keep_1, Bn, H_0, H_1, S_0, S_1, q01_outer));
 }
 
+// Small-shape batched GEMM (row-major): out[b, m, n] = sum_k A[b, m, k] * Q[b, k, n].
+// One warp per output element; the 32 lanes stride-reduce over K. Built for the
+// small-M*N / large-K regime (rank-3 stage-1 with tiny H_kk), where cuBLAS picks
+// a 128x128-tiled sgemm that leaves nearly the whole N dimension idle — ~100 us
+// on shapes whose real work is a few microseconds. The warp-per-output reduction
+// keeps full occupancy even when M*N is small but K is large.
+__global__ void small_batched_gemm_rm_kernel(const float* __restrict__ A, const float* __restrict__ Q,
+                                             float* __restrict__ out, int Bn, int M, int N, int K) {
+  const int     warp  = static_cast<int>((static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5);
+  const int     lane  = threadIdx.x & 31;
+  const int64_t MN    = static_cast<int64_t>(M) * N;
+  const int64_t total = static_cast<int64_t>(Bn) * MN;
+  if (warp >= total) return;  // whole warp shares `warp`, so warp_reduce_sum below is never partial
+
+  const int     b = static_cast<int>(warp / MN);
+  const int64_t r = warp - static_cast<int64_t>(b) * MN;
+  const int     m = static_cast<int>(r / N);
+  const int     n = static_cast<int>(r - static_cast<int64_t>(m) * N);
+
+  const float* __restrict__ A_bm = A + (static_cast<size_t>(b) * M + m) * K;  // A[b, m, :], contiguous in k
+  const float* __restrict__ Q_bn = Q + static_cast<size_t>(b) * K * N + n;     // Q[b, :, n], stride N over k
+  float acc = 0.0f;
+  for (int k = lane; k < K; k += 32) acc += A_bm[k] * Q_bn[static_cast<size_t>(k) * N];
+  acc = warp_reduce_sum(acc);
+  if (lane == 0) out[static_cast<size_t>(b) * MN + r] = acc;
+}
+
+cudaError_t launch_small_batched_gemm_rm(const float* a_rm, const float* q01_outer, float* out_rm, int Bn, int M, int N,
+                                         int K, cudaStream_t stream) {
+  const int64_t total_warps = static_cast<int64_t>(Bn) * M * N;
+  if (total_warps <= 0 || K <= 0) return cudaSuccess;
+  constexpr int block         = 128;  // 4 warps/block
+  const int64_t total_threads = total_warps * 32;
+  const int     blocks        = static_cast<int>((total_threads + block - 1) / block);
+  small_batched_gemm_rm_kernel<<<blocks, block, 0, stream>>>(a_rm, q01_outer, out_rm, Bn, M, N, K);
+  return cudaGetLastError();
+}
+
 // Transpose tmp_qo_cublas[Bn, O*S_split, H_kk] → tmp_my[Bn, H_kk, O, S_split].
 // One thread per output; stage-2 reads the latter for cache-friendly striding.
 __global__ void tmp_qo_cublas_to_my_kernel(const float* __restrict__ tmp_cublas, int Bn, int O, int S_split, int H_kk,
@@ -905,18 +797,18 @@ __global__ void tmp_qo_cublas_to_my_kernel(const float* __restrict__ tmp_cublas,
   const int64_t total = static_cast<int64_t>(Bn) * per_b;
   if (idx >= total) return;
 
-  const int     b   = static_cast<int>(idx / per_b);
-  int64_t       r   = idx - static_cast<int64_t>(b) * per_b;
-  const int64_t oS  = static_cast<int64_t>(O) * S_split;
-  const int     h   = static_cast<int>(r / oS);
+  const int     b  = static_cast<int>(idx / per_b);
+  int64_t       r  = idx - static_cast<int64_t>(b) * per_b;
+  const int64_t oS = static_cast<int64_t>(O) * S_split;
+  const int     h  = static_cast<int>(r / oS);
   r -= static_cast<int64_t>(h) * oS;
-  const int     o   = static_cast<int>(r / S_split);
-  const int     s   = static_cast<int>(r - static_cast<int64_t>(o) * S_split);
+  const int o = static_cast<int>(r / S_split);
+  const int s = static_cast<int>(r - static_cast<int64_t>(o) * S_split);
 
   // tmp_cublas[b, o*S_split + s, h] to tmp_my[b, h, o, s].
   const size_t cublas_off =
       static_cast<size_t>(b) * O * S_split * H_kk + static_cast<size_t>(o * S_split + s) * H_kk + h;
-  tmp_my[idx]             = tmp_cublas[cublas_off];
+  tmp_my[idx] = tmp_cublas[cublas_off];
 }
 
 cudaError_t launch_tmp_qo_cublas_to_my(const float* tmp_cublas, int Bn, int O, int S_split, int H_kk, float* tmp_my,
@@ -935,10 +827,10 @@ __global__ void tmp_lin_per_h_kernel(const float* __restrict__ q01_outer, const 
   const int64_t total = static_cast<int64_t>(Bn) * per_b;
   if (idx >= total) return;
 
-  const int     b  = static_cast<int>(idx / per_b);
-  int64_t       r  = idx - static_cast<int64_t>(b) * per_b;
-  const int     h  = static_cast<int>(r / S_split);
-  const int     s2 = static_cast<int>(r - static_cast<int64_t>(h) * S_split);
+  const int b  = static_cast<int>(idx / per_b);
+  int64_t   r  = idx - static_cast<int64_t>(b) * per_b;
+  const int h  = static_cast<int>(r / S_split);
+  const int s2 = static_cast<int>(r - static_cast<int64_t>(h) * S_split);
 
   const float* q01_b    = q01_outer + static_cast<size_t>(b) * K_keep * H_kk;
   const float* linear_b = linear + static_cast<size_t>(b) * K_keep * S_split;
@@ -956,20 +848,59 @@ cudaError_t launch_tmp_lin_per_h(const float* q01_outer, const float* linear, in
                       q01_outer, linear, Bn, K_keep, H_kk, S_split, tmp_lin));
 }
 
+// Same contraction as tmp_lin_per_h_kernel, but one warp per output (b, h, s2)
+// with the 32 lanes stride-reducing over K_keep. tmp_lin_per_h gives one thread
+// per output and a serial K loop; when H_kk*S_split is small (the short
+// policy_len regime) that under-occupies the GPU and the K_keep loop dominates
+// (~155 us in the rollout_loop profile). Warp-parallel K keeps full occupancy.
+__global__ void tmp_lin_warp_kernel(const float* __restrict__ q01_outer, const float* __restrict__ linear, int Bn,
+                                    int K_keep, int H_kk, int S_split, float* __restrict__ tmp_lin) {
+  const int     warp  = static_cast<int>((static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5);
+  const int     lane  = threadIdx.x & 31;
+  const int64_t HS    = static_cast<int64_t>(H_kk) * S_split;
+  const int64_t total = static_cast<int64_t>(Bn) * HS;
+  if (warp >= total) return;  // whole warp shares `warp`; warp_reduce_sum below is never partial
+
+  const int     b  = static_cast<int>(warp / HS);
+  const int64_t r  = warp - static_cast<int64_t>(b) * HS;
+  const int     h  = static_cast<int>(r / S_split);
+  const int     s2 = static_cast<int>(r - static_cast<int64_t>(h) * S_split);
+
+  const float* __restrict__ q01_b = q01_outer + static_cast<size_t>(b) * K_keep * H_kk;
+  const float* __restrict__ lin_b = linear + static_cast<size_t>(b) * K_keep * S_split;
+  float acc = 0.0f;
+  for (int k = lane; k < K_keep; k += 32) {
+    acc += q01_b[static_cast<size_t>(k) * H_kk + h] * lin_b[static_cast<size_t>(k) * S_split + s2];
+  }
+  acc = warp_reduce_sum(acc);
+  if (lane == 0) tmp_lin[static_cast<size_t>(b) * HS + r] = acc;
+}
+
+cudaError_t launch_tmp_lin_warp(const float* q01_outer, const float* linear, int Bn, int K_keep, int H_kk, int S_split,
+                                float* tmp_lin, cudaStream_t stream) {
+  const int64_t total_warps = static_cast<int64_t>(Bn) * H_kk * S_split;
+  if (total_warps <= 0 || K_keep <= 0) return cudaSuccess;
+  constexpr int block         = 128;  // 4 warps/block
+  const int64_t total_threads = total_warps * 32;
+  const int     blocks        = static_cast<int>((total_threads + block - 1) / block);
+  tmp_lin_warp_kernel<<<blocks, block, 0, stream>>>(q01_outer, linear, Bn, K_keep, H_kk, S_split, tmp_lin);
+  return cudaGetLastError();
+}
+
 // Rank-2 cuBLAS finish. Reads tmp_qo[Bn, O, H_kk] from the cuBLAS GEMM,
 // folds in entropy + linear (+ pA when USE_PA). One thread per (b, h_kk).
 //
-// O is a compile-time template parameter (mirroring rank-3 stage 2) so the
-// o-loop fully unrolls; with O runtime, nvcc emits a serial-dependent load
-// chain that bottlenecks on memory latency. Unrolling exposes O independent
-// loads per thread for the entropy/pA pass — ILP fills the latency window.
+// The linear term sum_k q01[b,k,h]*linear[b,k] is precomputed into
+// tmp_lin[Bn, H_kk] by a cuBLAS GEMM (linear @ q01_outer) in the launcher —
+// the K_d reduction must parallelize across threads, and one-thread-per-(b,h)
+// here only exposes Bn*H_kk threads (64 in the high-dim/few-policy regime),
+// which serially looping K_d=O(4096) leaves the GPU ~97% idle.
+//
 template <int O_TPL, bool USE_STATES, bool USE_LINEAR, bool USE_PA>
 __global__ void
 modality_score_dedup_rank2_cublas_finish_kernel(const float* __restrict__ tmp_qo, const float* __restrict__ tmp_wa,
-                                                const float* __restrict__ q01_outer, const float* __restrict__ linear,
-                                                int Bn, int H_kk, int K_d, int64_t b_stride,
-                                                float* __restrict__ score_out) {
-  // 2-D grid: blockIdx.y = b, blockIdx.x*blockDim.x+threadIdx.x = h.
+                                                const float* __restrict__ tmp_lin, int Bn, int H_kk, int lin_b_stride,
+                                                int64_t b_stride, float* __restrict__ score_out) {
   const int b = blockIdx.y;
   const int h = blockIdx.x * blockDim.x + threadIdx.x;
   if (h >= H_kk) return;
@@ -987,31 +918,14 @@ modality_score_dedup_rank2_cublas_finish_kernel(const float* __restrict__ tmp_qo
     }
   }
 
-  float linear_acc = 0.0f;
-  if (USE_LINEAR) {
-    const float* q01_b = q01_outer + static_cast<size_t>(b) * K_d * H_kk;
-    const float* lin_b = linear + static_cast<size_t>(b) * K_d;
-    // K_d is runtime (varies by modality) so we partial-unroll for ILP
-    // without exploding the instruction cache footprint.
-#pragma unroll 4
-    for (int k = 0; k < K_d; ++k) linear_acc += q01_b[k * H_kk + h] * lin_b[k];
-  }
-
+  float linear_acc = USE_LINEAR ? tmp_lin[static_cast<size_t>(b) * lin_b_stride + h] : 0.0f;
   write_modality_score<USE_STATES>(score_out, b, b_stride, h, acc_ent, linear_acc + pA_acc);
 }
 
-// Runtime-O fallback for modalities with O > 8 (the templated path's
-// PYMDP_CUDA_DISPATCH_1_8 caps at 8 instantiations to keep binary size
-// bounded). Without compile-time O nvcc can't fully unroll, but `#pragma
-// unroll 4` still buys 4× ILP for latency hiding on the entropy/pA pass.
 template <bool USE_STATES, bool USE_LINEAR, bool USE_PA>
-__global__ void
-modality_score_dedup_rank2_cublas_finish_runtime_o_kernel(const float* __restrict__ tmp_qo,
-                                                          const float* __restrict__ tmp_wa,
-                                                          const float* __restrict__ q01_outer,
-                                                          const float* __restrict__ linear, int Bn, int O, int H_kk,
-                                                          int K_d, int64_t b_stride, float* __restrict__ score_out) {
-  // 2-D grid: blockIdx.y = b, blockIdx.x*blockDim.x+threadIdx.x = h.
+__global__ void modality_score_dedup_rank2_cublas_finish_runtime_o_kernel(
+    const float* __restrict__ tmp_qo, const float* __restrict__ tmp_wa, const float* __restrict__ tmp_lin, int Bn,
+    int O, int H_kk, int lin_b_stride, int64_t b_stride, float* __restrict__ score_out) {
   const int b = blockIdx.y;
   const int h = blockIdx.x * blockDim.x + threadIdx.x;
   if (h >= H_kk) return;
@@ -1029,37 +943,30 @@ modality_score_dedup_rank2_cublas_finish_runtime_o_kernel(const float* __restric
     }
   }
 
-  float linear_acc = 0.0f;
-  if (USE_LINEAR) {
-    const float* q01_b = q01_outer + static_cast<size_t>(b) * K_d * H_kk;
-    const float* lin_b = linear + static_cast<size_t>(b) * K_d;
-#pragma unroll 4
-    for (int k = 0; k < K_d; ++k) linear_acc += q01_b[k * H_kk + h] * lin_b[k];
-  }
-
+  float linear_acc = USE_LINEAR ? tmp_lin[static_cast<size_t>(b) * lin_b_stride + h] : 0.0f;
   write_modality_score<USE_STATES>(score_out, b, b_stride, h, acc_ent, linear_acc + pA_acc);
 }
 
 namespace {
 
 template <int O_TPL, bool USE_STATES, bool USE_LINEAR, bool USE_PA>
-inline void launch_rank2_cublas_finish_tpl(const float* tmp_qo, const float* tmp_wa, const float* q01_outer,
-                                           const float* linear, int Bn, int H_kk, int K_d, int64_t b_stride,
-                                           float* score_out, cudaStream_t stream) {
+inline void launch_rank2_cublas_finish_tpl(const float* tmp_qo, const float* tmp_wa, const float* tmp_lin, int Bn,
+                                           int H_kk, int lin_b_stride, int64_t b_stride, float* score_out,
+                                           cudaStream_t stream) {
   if (Bn <= 0 || H_kk <= 0) return;
   const int64_t total      = static_cast<int64_t>(Bn) * H_kk;
   const int     block_size = launch_block_size_1d(stream, total);
   // 2-D grid keeps b on blockIdx.y so the kernel skips the 64-bit (b, h) decode.
   const dim3 grid(static_cast<unsigned>(launch_blocks(H_kk, block_size)), static_cast<unsigned>(Bn));
   modality_score_dedup_rank2_cublas_finish_kernel<O_TPL, USE_STATES, USE_LINEAR, USE_PA>
-      <<<grid, block_size, 0, stream>>>(tmp_qo, tmp_wa, q01_outer, linear, Bn, H_kk, K_d, b_stride, score_out);
+      <<<grid, block_size, 0, stream>>>(tmp_qo, tmp_wa, tmp_lin, Bn, H_kk, lin_b_stride, b_stride, score_out);
 }
 
 }  // namespace
 
 cudaError_t launch_modality_score_dedup_rank2_cublas_finish(const float* tmp_qo, const float* tmp_wa,
-                                                            const float* q01_outer, const float* linear, int Bn, int O,
-                                                            int H_kk, int K_d, int64_t b_stride, bool use_states,
+                                                            const float* tmp_lin, int Bn, int O, int H_kk,
+                                                            int lin_b_stride, int64_t b_stride, bool use_states,
                                                             bool use_linear, bool use_pA, float* score_out,
                                                             cudaStream_t stream) {
   const int64_t total = static_cast<int64_t>(Bn) * H_kk;
@@ -1071,7 +978,7 @@ cudaError_t launch_modality_score_dedup_rank2_cublas_finish(const float* tmp_qo,
   // reject here.
   if (O <= 8) {
 #define RANK2_FINISH_BOOL_BODY(S, L, P)                                                                                \
-  launch_rank2_cublas_finish_tpl<RANK2_FINISH_O_VAL, S, L, P>(tmp_qo, tmp_wa, q01_outer, linear, Bn, H_kk, K_d,        \
+  launch_rank2_cublas_finish_tpl<RANK2_FINISH_O_VAL, S, L, P>(tmp_qo, tmp_wa, tmp_lin, Bn, H_kk, lin_b_stride,         \
                                                               b_stride, score_out, stream)
 #define RANK2_FINISH_CASE(N)                                                                                           \
   case N: {                                                                                                            \
@@ -1087,7 +994,7 @@ cudaError_t launch_modality_score_dedup_rank2_cublas_finish(const float* tmp_qo,
     const dim3 grid(static_cast<unsigned>(launch_blocks(H_kk, block_size)), static_cast<unsigned>(Bn));
 #define RANK2_FINISH_RT_BODY(S, L, P)                                                                                  \
   modality_score_dedup_rank2_cublas_finish_runtime_o_kernel<S, L, P>                                                   \
-      <<<grid, block_size, 0, stream>>>(tmp_qo, tmp_wa, q01_outer, linear, Bn, O, H_kk, K_d, b_stride, score_out)
+      <<<grid, block_size, 0, stream>>>(tmp_qo, tmp_wa, tmp_lin, Bn, O, H_kk, lin_b_stride, b_stride, score_out)
     PYMDP_DISPATCH_BOOL3(use_states, use_linear, use_pA, RANK2_FINISH_RT_BODY);
 #undef RANK2_FINISH_RT_BODY
   }
@@ -1108,9 +1015,6 @@ modality_score_dedup_rank3_split_stage2_kernel(const float* __restrict__ tmp_qo,
                                                const float* __restrict__ tmp_wa, const float* __restrict__ qs_split,
                                                int Bn, int H_keep_0, int H_keep_1, int H_split, int S_split,
                                                int64_t b_stride, float* __restrict__ score_out) {
-  // 2-D grid: blockIdx.y = b; blockIdx.x*blockDim.x+threadIdx.x = (h_0, h_1,
-  // h_2) flat index. per_b = H_keep_0 * H_keep_1 * H_split fits int32 in the
-  // production envelope, so the inner decode stays 32-bit.
   const int b     = blockIdx.y;
   const int inner = blockIdx.x * blockDim.x + threadIdx.x;
   const int H_12  = H_keep_1 * H_split;
@@ -1140,8 +1044,6 @@ modality_score_dedup_rank3_split_stage2_kernel(const float* __restrict__ tmp_qo,
     for (int o = 0; o < O_TPL; ++o) {
       float qo_o = 0.0f;
       float wa_o = 0.0f;
-      // Fuse qo / wa S_split walks: one qs2_p[s] load feeds both contractions
-      // when USE_PA is on; USE_PA == false DCEs the wa accumulator entirely.
       for (int s = 0; s < S_split; ++s) {
         const float q = qs2_p[s];
         qo_o += tmp_qo_w[o * S_split + s] * q;
@@ -1157,22 +1059,15 @@ modality_score_dedup_rank3_split_stage2_kernel(const float* __restrict__ tmp_qo,
     for (int s = 0; s < S_split; ++s) linear_acc += tmp_lin_w[s] * qs2_p[s];
   }
 
-  // local_idx matches the pmi encoding in build_factor_history_tables.
   const int64_t local_idx = static_cast<int64_t>((h_0 * H_keep_1 + h_1)) * H_split + h_2;
   write_modality_score<USE_STATES>(score_out, b, b_stride, local_idx, acc_ent, linear_acc + pA_acc);
 }
 
-// Runtime-O fallback for rank-3 stage 2 (modalities with O > 8). Mirrors
-// the rank-2 finish runtime-O fallback; partial-unrolled o-loop.
 template <bool USE_STATES, bool USE_LINEAR, bool USE_PA>
-__global__ void
-modality_score_dedup_rank3_split_stage2_runtime_o_kernel(const float* __restrict__ tmp_qo,
-                                                         const float* __restrict__ tmp_lin,
-                                                         const float* __restrict__ tmp_wa,
-                                                         const float* __restrict__ qs_split, int Bn, int O,
-                                                         int H_keep_0, int H_keep_1, int H_split, int S_split,
-                                                         int64_t b_stride, float* __restrict__ score_out) {
-  // 2-D grid — see templated variant.
+__global__ void modality_score_dedup_rank3_split_stage2_runtime_o_kernel(
+    const float* __restrict__ tmp_qo, const float* __restrict__ tmp_lin, const float* __restrict__ tmp_wa,
+    const float* __restrict__ qs_split, int Bn, int O, int H_keep_0, int H_keep_1, int H_split, int S_split,
+    int64_t b_stride, float* __restrict__ score_out) {
   const int b     = blockIdx.y;
   const int inner = blockIdx.x * blockDim.x + threadIdx.x;
   const int H_12  = H_keep_1 * H_split;
@@ -1187,9 +1082,8 @@ modality_score_dedup_rank3_split_stage2_runtime_o_kernel(const float* __restrict
   const int    total_h_keep = H_keep_0 * H_keep_1;
   const int    h_keep       = h_0 * H_keep_1 + h_1;
   const float* qs2_p        = qs_split + (b * H_split + h_2) * S_split;
-  const float* tmp_qo_w     = (USE_STATES || USE_PA)
-                                  ? (tmp_qo + ((static_cast<size_t>(b) * total_h_keep + h_keep) * O) * S_split)
-                                  : nullptr;
+  const float* tmp_qo_w =
+      (USE_STATES || USE_PA) ? (tmp_qo + ((static_cast<size_t>(b) * total_h_keep + h_keep) * O) * S_split) : nullptr;
   const float* tmp_wa_w =
       USE_PA ? (tmp_wa + ((static_cast<size_t>(b) * total_h_keep + h_keep) * O) * S_split) : nullptr;
   const float* tmp_lin_w =
@@ -1202,7 +1096,6 @@ modality_score_dedup_rank3_split_stage2_runtime_o_kernel(const float* __restrict
     for (int o = 0; o < O; ++o) {
       float qo_o = 0.0f;
       float wa_o = 0.0f;
-      // Fused qo / wa S_split walk — see templated variant for rationale.
       for (int s = 0; s < S_split; ++s) {
         const float q = qs2_p[s];
         qo_o += tmp_qo_w[o * S_split + s] * q;
@@ -1242,7 +1135,7 @@ inline void launch_rank3_stage2_tpl(const float* tmp_qo, const float* tmp_lin, c
   constexpr int block_size = 256;
   const int     per_b      = H_keep_0 * H_keep_1 * H_split;
   // 2-D grid keeps b on blockIdx.y so the kernel skips the 64-bit decode.
-  const dim3    grid(static_cast<unsigned>(launch_blocks(per_b, block_size)), static_cast<unsigned>(Bn));
+  const dim3 grid(static_cast<unsigned>(launch_blocks(per_b, block_size)), static_cast<unsigned>(Bn));
   modality_score_dedup_rank3_split_stage2_kernel<O_TPL, USE_STATES, USE_LINEAR, USE_PA>
       <<<grid, block_size, 0, stream>>>(tmp_qo, tmp_lin, tmp_wa, qs_split, Bn, H_keep_0, H_keep_1, H_split, S_split,
                                         b_stride, score_out);
@@ -1488,59 +1381,182 @@ cudaError_t launch_final_scatter_dedup(const float* scores_concat, const float* 
   return cudaGetLastError();
 }
 
-// -----------------------------------------------------------------------------
-// Content-tag gather kernel
-// -----------------------------------------------------------------------------
-//
-// Sample kContentTagTotalSamples (24) 4-byte words from each fingerprinted
-// device buffer at the same positions content_tag()/content_tag_from_samples()
-// use on the host. Output lands in a managed/host-readable buffer so the
-// CUDA-Dev warm check can recompute the FNV-1a tag from the gathered samples
-// and compare it to the cached host-computed tag — catching in-place A/B
-// mutations (e.g. the agent's learning step) that reuse the same device
-// pointer + shape.
-//
-// One launch dispatches one block (one warp) per buffer; only the first
-// kContentTagTotalSamples of the 32 threads produce output. Sources are read
-// as raw 32-bit words, so the same kernel covers both float A/B/C/pA/pB and
-// int32 policy-matrix buffers. Stride positions come from the shared
-// content_tag_stride_index() in common/content_tag_index.h, so host and device
-// sample identical positions from one definition.
-//
-// Per buffer: prefix slots [0, kContentTagPrefixMax) read src[i] (clamped to
-// size-1 when i >= size — the host hash ignores those slots), stride slots
-// read src[content_tag_stride_index(slot - kContentTagPrefixMax, size)].
-// Absent buffers (src == nullptr or size <= 0) zero their slot.
-__global__ void content_tag_gather_batch_kernel(ContentTagBatchJobs jobs, int n_jobs, uint32_t* __restrict__ dst,
-                                                int dst_stride) {
-  const int b = blockIdx.x;
-  if (b >= n_jobs) return;
-  const int i = threadIdx.x;
-  if (i >= kContentTagTotalSamples) return;
+// ----------------------------------------------------------------------------
+// Device-side A/B/linear repack (learning fast path). See kernels.h for the
+// rationale; the gathered per-modality / per-factor slices are D2D
+// cudaMemcpy2DAsync issued from cache.cc, so only these two kernels live here.
+// ----------------------------------------------------------------------------
 
-  const uint32_t* src  = reinterpret_cast<const uint32_t*>(jobs.src[b]);
-  const int64_t   size = jobs.size[b];
-  uint32_t*       out  = dst + static_cast<int64_t>(b) * dst_stride;
-
-  if (src == nullptr || size <= 0) {
-    out[i] = 0u;
-    return;
-  }
-  int64_t idx;
-  if (i < kContentTagPrefixMax) {
-    idx = (static_cast<int64_t>(i) < size) ? static_cast<int64_t>(i) : (size - 1);
-  } else {
-    idx = content_tag_stride_index(i - kContentTagPrefixMax, size);
-  }
-  out[i] = src[idx];
+// Mirror the host xlogx (logexp_f32.h): x * logf(max(x, kLogEps)), kLogEps=1e-12.
+__device__ __forceinline__ float dev_xlogx(float x) {
+  return x * logf(fmaxf(x, 1e-12f));
 }
 
-cudaError_t launch_content_tag_gather_batch(const ContentTagBatchJobs& jobs, int n_jobs, void* dst, int dst_stride,
-                                            cudaStream_t stream) {
-  if (n_jobs <= 0) return cudaSuccess;
-  if (n_jobs > kContentTagBatchMax) return cudaErrorInvalidValue;
-  content_tag_gather_batch_kernel<<<n_jobs, 32, 0, stream>>>(jobs, n_jobs, reinterpret_cast<uint32_t*>(dst), dst_stride);
-  return cudaGetLastError();
+// dst[b, (o*S_split+s)*K_keep + k] = packed[b, (o*K_keep+k)*S_split + s].
+// One thread per output element. Output per-batch layout is [O_m, S_split, K_keep].
+__global__ void a_rank3_cublas_view_kernel(const float* __restrict__ packed, int Bn, int O_m, int K_keep, int S_split,
+                                           float* __restrict__ dst) {
+  const int64_t idx   = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t per_b = static_cast<int64_t>(O_m) * S_split * K_keep;
+  const int64_t total = static_cast<int64_t>(Bn) * per_b;
+  if (idx >= total) return;
+
+  const int     b  = static_cast<int>(idx / per_b);
+  int64_t       r  = idx - static_cast<int64_t>(b) * per_b;
+  const int64_t sk = static_cast<int64_t>(S_split) * K_keep;
+  const int     o  = static_cast<int>(r / sk);
+  r -= static_cast<int64_t>(o) * sk;
+  const int s = static_cast<int>(r / K_keep);
+  const int k = static_cast<int>(r - static_cast<int64_t>(s) * K_keep);
+
+  const size_t src_off = static_cast<size_t>(b) * per_b + (static_cast<size_t>(o) * K_keep + k) * S_split + s;
+  dst[idx]             = packed[src_off];
+}
+
+cudaError_t launch_a_rank3_cublas_view(const float* packed, int Bn, int O_m, int K_keep, int S_split, float* dst,
+                                       cudaStream_t stream) {
+  PYMDP_LAUNCH_1D(static_cast<int64_t>(Bn) * O_m * S_split * K_keep,
+                  a_rank3_cublas_view_kernel<<<pymdp_launch_blocks, pymdp_block_size, 0, stream>>>(
+                      packed, Bn, O_m, K_keep, S_split, dst));
+}
+
+// dst[b, k] = (use_utility ? sum_o A_g[b, o, k] * C_btm[o] : 0)
+//           + (use_states_info_gain ? sum_o xlogx(A_g[b, o, k]) : 0)
+// A_g per-batch layout [O, K_m]; C_btm = C + b*C_off_M + C_off_m + t*O, length O.
+__global__ void linear_precompute_tm_kernel(const float* __restrict__ A_g, const float* __restrict__ C, int Bn, int O,
+                                            int K_m, int64_t C_off_M, int64_t C_off_m, int t, bool use_utility,
+                                            bool use_states_info_gain, float* __restrict__ dst) {
+  const int64_t idx   = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = static_cast<int64_t>(Bn) * K_m;
+  if (idx >= total) return;
+
+  const int    b     = static_cast<int>(idx / K_m);
+  const int    k     = static_cast<int>(idx - static_cast<int64_t>(b) * K_m);
+  const float* A_bk  = A_g + static_cast<size_t>(b) * O * K_m + k;  // stride K_m over o
+  const float* C_btm = C + static_cast<size_t>(b) * C_off_M + C_off_m + static_cast<int64_t>(t) * O;
+
+  float acc = 0.0f;
+  for (int o = 0; o < O; ++o) {
+    const float a = A_bk[static_cast<size_t>(o) * K_m];
+    if (use_utility) acc += a * C_btm[o];
+    if (use_states_info_gain) acc += dev_xlogx(a);
+  }
+  dst[idx] = acc;
+}
+
+cudaError_t launch_linear_precompute_tm(const float* A_g, const float* C, int Bn, int O, int K_m, int64_t C_off_M,
+                                        int64_t C_off_m, int t, bool use_utility, bool use_states_info_gain, float* dst,
+                                        cudaStream_t stream) {
+  PYMDP_LAUNCH_1D(static_cast<int64_t>(Bn) * K_m,
+                  linear_precompute_tm_kernel<<<pymdp_launch_blocks, pymdp_block_size, 0, stream>>>(
+                      A_g, C, Bn, O, K_m, C_off_M, C_off_m, t, use_utility, use_states_info_gain, dst));
+}
+
+// ----------------------------------------------------------------------------
+// Device wA/wB (param-info-gain) repack. Mirrors precompute_wA /
+// precompute_wB_transposed (neg_efe_precompute.h) so the learning + novelty
+// path rebuilds the Dirichlet weights on device — no host digamma + round-trip.
+// ----------------------------------------------------------------------------
+
+// pymdp.maths.MINVAL = std::numeric_limits<float>::epsilon() (= 2^-23).
+constexpr float kDevWnormMinval = 1.1920929e-7f;
+
+// Device port of digamma_f32 (common/kernel_primitives.h): recurrence to x >= 6
+// then the asymptotic Bernoulli expansion. Bit-pattern non-finite check so it
+// survives -ffast-math/--use_fast_math, matching the host.
+__device__ __forceinline__ float dev_digamma_f32(float x) {
+  const unsigned int bits = __float_as_uint(x);
+  if (!(x > 0.0f) || (bits & 0x7f800000u) == 0x7f800000u) return -1e30f;
+  float result = 0.0f;
+  int   steps  = 0;
+  while (x < 6.0f && steps < 64) {
+    result -= 1.0f / x;
+    x += 1.0f;
+    ++steps;
+  }
+  const float x2 = x * x;
+  const float x4 = x2 * x2;
+  const float x6 = x4 * x2;
+  const float x8 = x4 * x4;
+  result +=
+      logf(x) - 0.5f / x - 1.0f / (12.0f * x2) + 1.0f / (120.0f * x4) - 1.0f / (252.0f * x6) + 1.0f / (240.0f * x8);
+  return result;
+}
+
+// w(p; sum) = log(sum) - log(p) + 1/p - 1/sum + digamma(p) - digamma(sum); 0 for
+// p <= 0 (the JAX (p > 0) mask). The (log/inv/dig)_sum triple is the per-cell
+// summary of the safe column sum, computed once by the caller.
+__device__ __forceinline__ float dev_wnorm_weight(float p, float log_sum, float inv_sum, float dig_sum) {
+  if (p <= 0.0f) return 0.0f;
+  const float ps = fmaxf(p, kDevWnormMinval);
+  return log_sum - logf(ps) + 1.0f / ps - inv_sum + dev_digamma_f32(ps) - dig_sum;
+}
+
+// wA for one modality. pA per-batch layout [O, K_m] (stride K_m over o), strided
+// by pA_batch_stride; one thread per (b, k) folds the column sum then writes the
+// O entries. Output [O, K_m] matches A's packed layout.
+__global__ void wnorm_a_kernel(const float* __restrict__ pA, int64_t pA_batch_stride, int64_t pA_mod_off, int Bn, int O,
+                               int K_m, float* __restrict__ wA) {
+  const int64_t idx   = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = static_cast<int64_t>(Bn) * K_m;
+  if (idx >= total) return;
+
+  const int    b   = static_cast<int>(idx / K_m);
+  const int    k   = static_cast<int>(idx - static_cast<int64_t>(b) * K_m);
+  const float* pAb = pA + static_cast<int64_t>(b) * pA_batch_stride + pA_mod_off + k;  // stride K_m over o
+  float*       wAb = wA + static_cast<int64_t>(b) * O * K_m + k;
+
+  float sum = 0.0f;
+  for (int o = 0; o < O; ++o) sum += pAb[static_cast<int64_t>(o) * K_m];
+  const float ss      = fmaxf(sum, kDevWnormMinval);
+  const float log_sum = logf(ss);
+  const float inv_sum = 1.0f / ss;
+  const float dig_sum = dev_digamma_f32(ss);
+  for (int o = 0; o < O; ++o) {
+    wAb[static_cast<int64_t>(o) * K_m] =
+        dev_wnorm_weight(pAb[static_cast<int64_t>(o) * K_m], log_sum, inv_sum, dig_sum);
+  }
+}
+
+cudaError_t launch_wnorm_a(const float* pA, int64_t pA_batch_stride, int64_t pA_mod_off, int Bn, int O, int K_m,
+                           float* wA, cudaStream_t stream) {
+  PYMDP_LAUNCH_1D(static_cast<int64_t>(Bn) * K_m, wnorm_a_kernel<<<pymdp_launch_blocks, pymdp_block_size, 0, stream>>>(
+                                                      pA, pA_batch_stride, pA_mod_off, Bn, O, K_m, wA));
+}
+
+// wB for one factor. pB per-batch layout [S, K, U] (pB[(s*K+k)*U + u]); the
+// column sum is over S. One thread per (b, k, u) writes the transposed (U, S, K)
+// output wB[(u*S+s)*K + k], matching precompute_wB_transposed / pack_b_factors.
+__global__ void wnorm_b_kernel(const float* __restrict__ pB, int64_t pB_batch_stride, int64_t pB_fac_off, int Bn, int S,
+                               int K, int U, float* __restrict__ wB) {
+  const int64_t idx   = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = static_cast<int64_t>(Bn) * K * U;
+  if (idx >= total) return;
+
+  const int     b   = static_cast<int>(idx / (static_cast<int64_t>(K) * U));
+  const int64_t r   = idx - static_cast<int64_t>(b) * K * U;
+  const int     k   = static_cast<int>(r / U);
+  const int     u   = static_cast<int>(r - static_cast<int64_t>(k) * U);
+  const float*  pBb = pB + static_cast<int64_t>(b) * pB_batch_stride + pB_fac_off;
+  float*        wBb = wB + static_cast<int64_t>(b) * S * K * U;
+
+  float sum = 0.0f;
+  for (int s = 0; s < S; ++s) sum += pBb[(static_cast<int64_t>(s) * K + k) * U + u];
+  const float ss      = fmaxf(sum, kDevWnormMinval);
+  const float log_sum = logf(ss);
+  const float inv_sum = 1.0f / ss;
+  const float dig_sum = dev_digamma_f32(ss);
+  for (int s = 0; s < S; ++s) {
+    const float p                                  = pBb[(static_cast<int64_t>(s) * K + k) * U + u];
+    wBb[(static_cast<int64_t>(u) * S + s) * K + k] = dev_wnorm_weight(p, log_sum, inv_sum, dig_sum);
+  }
+}
+
+cudaError_t launch_wnorm_b(const float* pB, int64_t pB_batch_stride, int64_t pB_fac_off, int Bn, int S, int K, int U,
+                           float* wB, cudaStream_t stream) {
+  PYMDP_LAUNCH_1D(static_cast<int64_t>(Bn) * K * U,
+                  wnorm_b_kernel<<<pymdp_launch_blocks, pymdp_block_size, 0, stream>>>(pB, pB_batch_stride, pB_fac_off,
+                                                                                       Bn, S, K, U, wB));
 }
 
 }  // namespace cuda_kernels

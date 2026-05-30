@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -70,13 +69,8 @@ FfiError run_fpi_kernel_host(const float* ll_flat, int64_t ll_count, const float
 
   const int64_t total_S  = lp_offsets[F];
   const int64_t total_ll = ll_offsets[M];
-  if (total_S <= 0 || lp_count <= 0 || lp_count % total_S != 0) {
-    return invalid_arg(kFpiKernelName, "lp_flat size = " + std::to_string(lp_count) +
-                                           " not divisible by total_S = " + std::to_string(total_S));
-  }
-  const int64_t batch = lp_count / total_S;
-  PYMDP_TRY(check_count(kFpiKernelName, "ll_flat", ll_count, batch * total_ll));
-  PYMDP_TRY(check_count(kFpiKernelName, "q_out", q_count, batch * total_S));
+  int64_t       batch    = 0;
+  PYMDP_TRY(validate_fpi_batch_shapes(lp_count, ll_count, q_count, total_S, total_ll, &batch));
 
   // Caller-validated invariants — restate so the optimizer can drop zero-trip
   // guards on the per-batch / per-factor / per-modality loops below.

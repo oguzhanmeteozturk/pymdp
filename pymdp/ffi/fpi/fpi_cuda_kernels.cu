@@ -1,25 +1,19 @@
-// Native CUDA FPI kernel — one block per batch element, all `num_iter`
-// fixed-point iterations executed internally.
-//
-// Algorithm mirrors fpi_cpu_runner.cc's run_fpi_kernel_host body (per-iter
-// softmax → reset to log_prior → modality marginals → convergence check),
-// lifted into a single kernel so the whole run stays on the CUDA stream with
-// no host roundtrip.
-//
-// Per-modality marginal accumulation uses K independent passes over `ll_m`
-// (one output factor per pass), trading a re-read of the modality likelihood
-// for atomic-free writes to log_q. ll_m fits in L1 for production shapes
-// (S0*S1*S2 < 1 KB) so the re-reads stay cheap.
+// Native CUDA FPI: one block per batch, all iterations internally.
+// Per-modality: K independent passes over ll_m (one output per pass);
+// re-read ll_m to avoid atomics. L1 resident for production shapes.
 
 #include <cuda_runtime.h>
 #include <cstdint>
 
 #include "fpi/fpi_cuda_kernels.h"
+#include "common/cuda_warp_reduce.h"
+#include "common/fpi_convergence_tol.h"
 
 namespace pymdp_ffi {
 namespace fpi_cuda {
 
 namespace {
+using namespace cuda_kernels;
 
 // Block size 256 (8 warps). K=3 / K=2 split-reduce widths (kTpO) target full
 // block utilization at this size — see modality_K3_split's header.
@@ -27,31 +21,10 @@ constexpr int kBlockSize = 256;
 constexpr int kWarpSize  = 32;
 constexpr int kNumWarps  = kBlockSize / kWarpSize;  // 8
 
-// ----- Warp-level reductions (full 32-lane mask) -----
-__device__ __forceinline__ float warp_reduce_max(float v) {
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 8));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 4));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
-  return v;
-}
+// warp_reduce, MaxOp, SumOp, warp_reduce_max, warp_reduce_sum hoisted to common/cuda_warp_reduce.h
 
-__device__ __forceinline__ float warp_reduce_sum(float v) {
-  v += __shfl_xor_sync(0xffffffffu, v, 16);
-  v += __shfl_xor_sync(0xffffffffu, v, 8);
-  v += __shfl_xor_sync(0xffffffffu, v, 4);
-  v += __shfl_xor_sync(0xffffffffu, v, 2);
-  v += __shfl_xor_sync(0xffffffffu, v, 1);
-  return v;
-}
-
-// ----- Block-level reductions via single-sync redundant-warp pattern -----
-//
-// `scratch` must be at least kNumWarps floats. Returns the block-wide max to
-// every thread. Every warp redundantly reads scratch[0..kNumWarps) and
-// warp-shuffle-reduces, so no broadcast sync is needed. Lanes [kNumWarps, 32)
-// seed from -INFINITY so warp_reduce_max returns the correct max-over-warps.
+// Block-wide max via redundant-warp pattern: warps write to scratch, then
+// all warps redundantly reduce (no broadcast sync needed).
 __device__ __forceinline__ float block_reduce_max(float v, float* scratch) {
   const int tid  = threadIdx.x;
   const int lane = tid & (kWarpSize - 1);
@@ -65,14 +38,8 @@ __device__ __forceinline__ float block_reduce_max(float v, float* scratch) {
   return v;
 }
 
-// ----- Partial warp-shuffle sum over a group of kTpO lanes (power of 2) -----
-//
-// Each output state in the modality split passes is owned by a kTpO-sized
-// lane group. After per-lane partial-sum accumulation across the inner
-// reduction range, we shuffle-reduce inside the group. kTpO must divide 32
-// so the group lives within a warp (cross-warp shuffles are not supported).
-template <int kTpO>
-__device__ __forceinline__ float group_reduce_sum(float v) {
+// Partial warp-shuffle sum over kTpO lanes (power of 2; must divide 32).
+template <int kTpO> __device__ __forceinline__ float group_reduce_sum(float v) {
   static_assert(kTpO == 1 || kTpO == 2 || kTpO == 4 || kTpO == 8 || kTpO == 16 || kTpO == 32,
                 "kTpO must be a power of 2 between 1 and 32");
 #pragma unroll
@@ -82,12 +49,8 @@ __device__ __forceinline__ float group_reduce_sum(float v) {
   return v;
 }
 
-// ----- Single-warp softmax over `n` floats -----
-//
-// Three-pass stable softmax with pure warp-shuffle reductions; one warp per
-// softmax. Fast path for n <= 32 keeps the exp result in a register. A
-// degenerate sum (all-`-inf` input -> s is 0 or NaN) falls back to uniform
-// 1/n, mirroring softmax_inplace.
+// Single-warp stable softmax: three-pass (max→exp→sum). Fast path for n≤32
+// (register temps). Degenerate sum falls back to uniform 1/n.
 __device__ void softmax_warp(const float* __restrict__ in, float* __restrict__ out, int n) {
   const int lane = threadIdx.x & (kWarpSize - 1);
 
@@ -122,30 +85,15 @@ __device__ void softmax_warp(const float* __restrict__ in, float* __restrict__ o
   }
 }
 
-// ----- K=1 modality: log_q_d0[s] += ll_m[s] -----
-//
-// No trailing __syncthreads here — the caller decides whether the cross-
-// modality WAW barrier is needed based on sync_mask. See the modality loop
-// in fpi_kernel / fpi_kernel_smallmeta.
+// K=1 modality: log_q_d0[s] += ll_m[s]. No trailing sync (caller gates barrier).
 __device__ void modality_K1(const float* __restrict__ ll_m, int S0, float* __restrict__ log_q_d0) {
   for (int s = threadIdx.x; s < S0; s += kBlockSize) {
     log_q_d0[s] += ll_m[s];
   }
 }
 
-// ----- K=2 modality, two-pass with kTpO-way split across the inner reduce -----
-//
-// Each output state is owned by `kTpO` consecutive lanes. The lanes split
-// the inner reduction range, then warp-shuffle-reduce inside the group;
-// lane 0 of each group writes the final sum. Pure warp-shuffle reduce with
-// zero __syncthreads inside the pass.
-//
-// IMPORTANT: group_reduce_sum's shuffles must run on ALL lanes regardless of
-// whether the lane's output index is in range. Gating the shuffle behind
-// `if (out_id < S)` when a warp straddles the boundary calls
-// __shfl_xor_sync(0xffffffff, ...) with lanes missing — UB that hangs on
-// Ampere. Instead, iterate stripes, let out-of-range lanes contribute sum=0,
-// run the shuffle unconditionally, and only the in-range lane 0 writes back.
+// K=2 modality: two passes, kTpO-way inner reduce split. Shuffles run
+// unconditionally (UB on Ampere if lane(s) skip); out-of-range lanes→sum=0.
 template <int kTpO>
 __device__ void modality_K2_split(const float* __restrict__ ll_m, int S0, int S1, const float* __restrict__ q0,
                                   const float* __restrict__ q1, float* __restrict__ log_q_d0,
@@ -167,8 +115,8 @@ __device__ void modality_K2_split(const float* __restrict__ ll_m, int S0, int S1
     const int s0  = s0_base + out_id;
     float     sum = 0.0f;
     if (s0 < S0) {
-      const float* row    = ll_m + s0 * S1;
-      const int    step   = 4 * kTpO;  // four lanes' worth of inner stride
+      const float* row  = ll_m + s0 * S1;
+      const int    step = 4 * kTpO;  // four lanes' worth of inner stride
       float        a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
       int          s1 = red_id;
       for (; s1 + 3 * kTpO < S1; s1 += step) {
@@ -211,17 +159,12 @@ __device__ void modality_K2_split(const float* __restrict__ ll_m, int S0, int S1
   // via sync_mask. See the modality loop in fpi_kernel / fpi_kernel_smallmeta.
 }
 
-// ----- K=3 modality, three-pass with per-pass kTpO split across the inner reduce -----
-//
-// Same structure as modality_K2_split, but each of the three passes carries
-// its own threads-per-output template parameter so it can be sized to its
-// output dim independently. The shipping callsite uses <8, 8, 8>, tuned
-// empirically on Orin sm_87 for production shapes S=[32,24,16].
+// K=3 modality: three passes, each with per-dim kTpO template (tuned <8,8,8>).
 template <int kTpO_p1, int kTpO_p2, int kTpO_p3>
-__device__ void modality_K3_split(const float* __restrict__ ll_m, int S0, int S1, int S2,
-                                  const float* __restrict__ q0, const float* __restrict__ q1,
-                                  const float* __restrict__ q2, float* __restrict__ log_q_d0,
-                                  float* __restrict__ log_q_d1, float* __restrict__ log_q_d2) {
+__device__ void modality_K3_split(const float* __restrict__ ll_m, int S0, int S1, int S2, const float* __restrict__ q0,
+                                  const float* __restrict__ q1, const float* __restrict__ q2,
+                                  float* __restrict__ log_q_d0, float* __restrict__ log_q_d1,
+                                  float* __restrict__ log_q_d2) {
   const int tid = threadIdx.x;
   const int S12 = S1 * S2;
 
@@ -338,29 +281,24 @@ __device__ void modality_K3_split(const float* __restrict__ ll_m, int S0, int S1
 // log_q_prev convergence snapshot is folded into the per-iter softmax pass
 // (see the softmax dispatch loop below), so the convergence check costs only
 // the block_reduce_max at iter end.
-__global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, total_ll]
-                           const float* __restrict__ lp_flat,    // [batch, total_S]
-                           float* __restrict__       q_out,      // [batch, total_S]
-                           int                       F,
-                           int                       M,
-                           int                       total_ll,
-                           int                       total_S,
-                           int                       num_iter,
-                           const int32_t* __restrict__             S,            // [F]
-                           const int32_t* __restrict__             lp_offsets,   // [F]
-                           const ModalityDispatchGpu* __restrict__ mods,         // [M]
-                           uint32_t                                sync_mask)
-{
-  const int    b     = blockIdx.x;
-  const float* ll_b  = ll_flat + static_cast<size_t>(b) * total_ll;
-  const float* lp_b  = lp_flat + static_cast<size_t>(b) * total_S;
+__global__ void fpi_kernel(const float* __restrict__ ll_flat,  // [batch, total_ll]
+                           const float* __restrict__ lp_flat,  // [batch, total_S]
+                           float* __restrict__ q_out,          // [batch, total_S]
+                           int F, int M, int total_ll, int total_S, int num_iter,
+                           const int32_t* __restrict__ S,                 // [F]
+                           const int32_t* __restrict__ lp_offsets,        // [F]
+                           const ModalityDispatchGpu* __restrict__ mods,  // [M]
+                           uint32_t sync_mask) {
+  const int    b       = blockIdx.x;
+  const float* ll_b    = ll_flat + static_cast<size_t>(b) * total_ll;
+  const float* lp_b    = lp_flat + static_cast<size_t>(b) * total_S;
   float*       q_out_b = q_out + static_cast<size_t>(b) * total_S;
 
   extern __shared__ float shmem[];
-  float* log_q      = shmem;
-  float* q          = log_q + total_S;
-  float* log_q_prev = q + total_S;
-  float* scratch    = log_q_prev + total_S;  // size kNumWarps
+  float*                  log_q      = shmem;
+  float*                  q          = log_q + total_S;
+  float*                  log_q_prev = q + total_S;
+  float*                  scratch    = log_q_prev + total_S;  // size kNumWarps
 
   // Init log_q to zero — matches the CPU kernel's std::memset.
   for (int i = threadIdx.x; i < total_S; i += kBlockSize) {
@@ -418,8 +356,8 @@ __global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, tota
         modality_K1(ll_m, md.Ss[0], log_q + md.lp_offs[0]);
         break;
       case 2:
-        modality_K2_split<kTpO>(ll_m, md.Ss[0], md.Ss[1], q + md.lp_offs[0], q + md.lp_offs[1],
-                                log_q + md.lp_offs[0], log_q + md.lp_offs[1]);
+        modality_K2_split<kTpO>(ll_m, md.Ss[0], md.Ss[1], q + md.lp_offs[0], q + md.lp_offs[1], log_q + md.lp_offs[0],
+                                log_q + md.lp_offs[1]);
         break;
       case 3:
         // Per-pass kTpO: <8, 8, 8> — tuned empirically on Orin sm_87. See
@@ -445,7 +383,7 @@ __global__ void fpi_kernel(const float* __restrict__ ll_flat,    // [batch, tota
         my_max_diff = fmaxf(my_max_diff, fabsf(log_q[i] - log_q_prev[i]));
       }
       const float max_diff = block_reduce_max(my_max_diff, scratch);
-      if (max_diff < 1e-5f) break;
+      if (max_diff < kFpiConvergenceTol) break;
     }
   }
 
@@ -491,27 +429,22 @@ __global__ void fpi_noop_kernel() {}
 // with S[f]/lp_offsets[f]/mods[m] replaced by meta.S[f]/meta.lp_offsets[f]/
 // meta.mods[m]. The duplication is deliberate: a shared templated impl risks
 // shifting fpi_kernel's SASS, which is fragile. scripts/sass_diff.sh flags drift.
-__global__ void fpi_kernel_smallmeta(const float* __restrict__ ll_flat,    // [batch, total_ll]
-                                     const float* __restrict__ lp_flat,    // [batch, total_S]
-                                     float* __restrict__       q_out,      // [batch, total_S]
-                                     int                       F,
-                                     int                       M,
-                                     int                       total_ll,
-                                     int                       total_S,
-                                     int                       num_iter,
-                                     FpiSmallMeta              meta,        // by-value, in cmem param bank
-                                     uint32_t                  sync_mask)
-{
-  const int    b     = blockIdx.x;
-  const float* ll_b  = ll_flat + static_cast<size_t>(b) * total_ll;
-  const float* lp_b  = lp_flat + static_cast<size_t>(b) * total_S;
+__global__ void fpi_kernel_smallmeta(const float* __restrict__ ll_flat,  // [batch, total_ll]
+                                     const float* __restrict__ lp_flat,  // [batch, total_S]
+                                     float* __restrict__ q_out,          // [batch, total_S]
+                                     int F, int M, int total_ll, int total_S, int num_iter,
+                                     FpiSmallMeta meta,  // by-value, in cmem param bank
+                                     uint32_t     sync_mask) {
+  const int    b       = blockIdx.x;
+  const float* ll_b    = ll_flat + static_cast<size_t>(b) * total_ll;
+  const float* lp_b    = lp_flat + static_cast<size_t>(b) * total_S;
   float*       q_out_b = q_out + static_cast<size_t>(b) * total_S;
 
   extern __shared__ float shmem[];
-  float* log_q      = shmem;
-  float* q          = log_q + total_S;
-  float* log_q_prev = q + total_S;
-  float* scratch    = log_q_prev + total_S;  // size kNumWarps
+  float*                  log_q      = shmem;
+  float*                  q          = log_q + total_S;
+  float*                  log_q_prev = q + total_S;
+  float*                  scratch    = log_q_prev + total_S;  // size kNumWarps
 
   for (int i = threadIdx.x; i < total_S; i += kBlockSize) {
     log_q[i] = 0.0f;
@@ -554,8 +487,8 @@ __global__ void fpi_kernel_smallmeta(const float* __restrict__ ll_flat,    // [b
         modality_K1(ll_m, md.Ss[0], log_q + md.lp_offs[0]);
         break;
       case 2:
-        modality_K2_split<kTpO>(ll_m, md.Ss[0], md.Ss[1], q + md.lp_offs[0], q + md.lp_offs[1],
-                                log_q + md.lp_offs[0], log_q + md.lp_offs[1]);
+        modality_K2_split<kTpO>(ll_m, md.Ss[0], md.Ss[1], q + md.lp_offs[0], q + md.lp_offs[1], log_q + md.lp_offs[0],
+                                log_q + md.lp_offs[1]);
         break;
       case 3:
         // Per-pass kTpO: <8, 8, 8> — tuned empirically on Orin sm_87. See
@@ -577,7 +510,7 @@ __global__ void fpi_kernel_smallmeta(const float* __restrict__ ll_flat,    // [b
         my_max_diff = fmaxf(my_max_diff, fabsf(log_q[i] - log_q_prev[i]));
       }
       const float max_diff = block_reduce_max(my_max_diff, scratch);
-      if (max_diff < 1e-5f) break;
+      if (max_diff < kFpiConvergenceTol) break;
     }
   }
 
@@ -601,8 +534,8 @@ cudaError_t launch_fpi_noop(int batch, int total_S, cudaStream_t stream) {
 }
 
 cudaError_t launch_fpi_smallmeta(const float* ll_flat, const float* lp_flat, float* q_out, int batch, int F, int M,
-                                 int total_ll, int total_S, int num_iter, const FpiSmallMeta& meta,
-                                 uint32_t sync_mask, cudaStream_t stream) {
+                                 int total_ll, int total_S, int num_iter, const FpiSmallMeta& meta, uint32_t sync_mask,
+                                 cudaStream_t stream) {
   if (batch <= 0 || total_S <= 0) return cudaSuccess;
   const size_t shmem_bytes = (static_cast<size_t>(3 * total_S) + kNumWarps) * sizeof(float);
   fpi_kernel_smallmeta<<<batch, kBlockSize, shmem_bytes, stream>>>(ll_flat, lp_flat, q_out, F, M, total_ll, total_S,

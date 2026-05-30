@@ -35,7 +35,7 @@ template <class T> inline void ensure_at_least(std::vector<T>& v, int64_t n) {
 // Stays header-only and templated so the FFI library doesn't need a
 // dedicated TU per element type.
 template <class T> class ScratchBuffer {
- public:
+public:
   void ensure(int64_t n) { ensure_at_least(storage_, n); }
 
   T*       data() noexcept { return storage_.data(); }
@@ -52,7 +52,7 @@ template <class T> class ScratchBuffer {
   std::vector<T>&       storage() noexcept { return storage_; }
   const std::vector<T>& storage() const noexcept { return storage_; }
 
- private:
+private:
   std::vector<T> storage_;
 };
 

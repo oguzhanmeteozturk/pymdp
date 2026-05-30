@@ -58,7 +58,7 @@ struct BRolloutParents {
 // per-(t, f) inductive score `sum_s qs_out[b, h, s] * v_full[b, qs_off_f + s]`
 // into the same block as phase 2: each thread that owns an s-stripe in
 // phase 2 accumulates the inductive partial alongside the factor_score
-// partial; both reduce via b_rollout_block_reduce_sum_lane0. `ind_score_t_f` is
+// partial; both reduce via block_reduce_sum_pair_lane0 (common/cuda_warp_reduce.h). `ind_score_t_f` is
 // the per-(t, f) base within inductive_concat [Bn, ind_b_stride].
 cudaError_t launch_b_rollout_general(const float* B, const float* wB_tr, const float* v_full, int qs_flat, int qs_off_f,
                                      const int32_t* action_h, const int32_t* parent_histories,
@@ -134,6 +134,13 @@ cudaError_t launch_final_scatter_dedup(const float* scores_concat, const float* 
 cudaError_t launch_build_qs01_outer(const float* qs_keep_0, const float* qs_keep_1, int Bn, int H_0, int H_1, int S_0,
                                     int S_1, float* q01_outer, cudaStream_t stream);
 
+// Small-shape batched GEMM (row-major): out[b, m, n] = sum_k a_rm[b, m, k] * q01_outer[b, k, n].
+// One warp per output, lanes reduce over K — tuned for small M*N / large K, where
+// cuBLAS's 128x128-tiled sgemm mostly idles. Drop-in for the rank-3 stage-1
+// run_batched_q01_gemm at small shapes; produces the identical [b, M, N] layout.
+cudaError_t launch_small_batched_gemm_rm(const float* a_rm, const float* q01_outer, float* out_rm, int Bn, int M, int N,
+                                         int K, cudaStream_t stream);
+
 // Rank-3 stage-1 only: transpose tmp_qo_cublas[Bn, O*S_split, H_kk] to
 // split_tmp_qo[Bn, H_kk, O, S_split] (the layout stage 2 expects).
 cudaError_t launch_tmp_qo_cublas_to_my(const float* tmp_cublas, int Bn, int O, int S_split, int H_kk, float* tmp_my,
@@ -144,13 +151,24 @@ cudaError_t launch_tmp_qo_cublas_to_my(const float* tmp_cublas, int Bn, int O, i
 cudaError_t launch_tmp_lin_per_h(const float* q01_outer, const float* linear, int Bn, int K_keep, int H_kk, int S_split,
                                  float* tmp_lin, cudaStream_t stream);
 
+// Same contraction as launch_tmp_lin_per_h, but one warp per output with the 32
+// lanes reducing over K_keep — for the small-H_kk*S_split / large-K_keep regime
+// where the thread-per-output per_h kernel under-occupies (see use_warp_gemm).
+cudaError_t launch_tmp_lin_warp(const float* q01_outer, const float* linear, int Bn, int K_keep, int H_kk, int S_split,
+                                float* tmp_lin, cudaStream_t stream);
+
 // Rank-2 finish (after build_qs01_outer + cublasSgemmStridedBatched
 // produces tmp_qo[Bn, O, H_kk]). Computes per (b, h_kk):
-//   score = -sum_o xlogx(tmp_qo[b, o, h]) + sum_k q01[b, k, h] * linear[b, k]
+//   score = -sum_o xlogx(tmp_qo[b, o, h]) + tmp_lin[b*lin_b_stride + h]
+// where the linear term is precomputed by a cuBLAS GEMM (the K_d reduction must
+// parallelize across threads; this kernel only has Bn*H_kk threads).
+// lin_b_stride = H_kk for a per-modality tmp_lin[Bn, H_kk], or M_group*H_kk
+// (with tmp_lin pre-offset to the modality column) when a dependency group's
+// linear terms are batched into one stacked GEMM output [Bn, M_group, H_kk].
 // One thread per (b, h_kk).
 cudaError_t launch_modality_score_dedup_rank2_cublas_finish(const float* tmp_qo, const float* tmp_wa,
-                                                            const float* q01_outer, const float* linear, int Bn, int O,
-                                                            int H_kk, int K_d, int64_t b_stride, bool use_states,
+                                                            const float* tmp_lin, int Bn, int O, int H_kk,
+                                                            int lin_b_stride, int64_t b_stride, bool use_states,
                                                             bool use_linear, bool use_pA, float* score_out,
                                                             cudaStream_t stream);
 
@@ -167,22 +185,46 @@ cudaError_t launch_modality_score_dedup_rank3_fused_tiny(const float* A_unflat, 
                                                          bool use_states, bool use_linear, bool use_pA,
                                                          float* score_out, cudaStream_t stream);
 
-// Content-tag gather. One launch dispatches `n_jobs` blocks (1 block per
-// buffer, one warp each); each block writes 24 contiguous 32-bit words into
-// its `dst` slot, sampled per content_tag()'s positions (16-prefix +
-// 8-stride). Caller syncs the stream and hashes each slot via
-// content_tag_from_samples() in common/cache_lru.h. Works for both float and
-// int32 src buffers (raw bit-copy); job sizes count 4-byte words. `dst_stride`
-// counts 32-bit words per slot (= kContentTagTotalSamples). Jobs with
-// src == nullptr or size <= 0 zero their slot. `kContentTagBatchMax` caps
-// `n_jobs` so the (src, size) arrays fit in kernel-arg space.
-constexpr int kContentTagBatchMax = 8;
-struct ContentTagBatchJobs {
-  const void* src[kContentTagBatchMax];
-  int64_t     size[kContentTagBatchMax];
-};
-cudaError_t launch_content_tag_gather_batch(const ContentTagBatchJobs& jobs, int n_jobs, void* dst, int dst_stride,
-                                            cudaStream_t stream);
+// ----------------------------------------------------------------------------
+// Device-side A/B/linear repack (learning fast path).
+//
+// When the model params are mutated in place every call (online learning),
+// the A/B caches must rebuild every call. These kernels rebuild the packed
+// representations directly from the device-resident A/B/C buffers, so the
+// learning cold path skips the D2H + host pack + implicit H2D that the
+// general cold path pays. The per-modality / per-factor strided slices are
+// plain D2D cudaMemcpy2DAsync (no kernel); only the rank-3 cuBLAS view and the
+// linear precompute need device kernels. Outputs are bit-for-bit the layouts
+// that pack_a_modalities / pack_rank3_cublas_view / build_linear_tm_slice
+// produce on the host.
+
+// Rank-3 cuBLAS-view permute (device pack_rank3_cublas_view). Reads the gathered
+// per-modality A `packed[Bn, O_m, K_keep, S_split]` and writes
+//   dst[b, (o*S_split+s)*K_keep + k] = packed[b, (o*K_keep+k)*S_split + s].
+cudaError_t launch_a_rank3_cublas_view(const float* packed, int Bn, int O_m, int K_keep, int S_split, float* dst,
+                                       cudaStream_t stream);
+
+// Per-(t, m) linear precompute (device build_linear_tm_slice). Reads the
+// gathered per-modality A `A_g[Bn, O, K_m]` and the device C base, writes
+//   dst[b, k] = (use_utility ? sum_o A_g[b, o, k] * C[b, C_off_m + t*O + o] : 0)
+//             + (use_states_info_gain ? sum_o xlogx(A_g[b, o, k]) : 0)
+// matching build_linear_tm_slice (which subtracts HA = -sum_o xlogx, i.e. adds
+// sum_o xlogx). xlogx uses logf(max(x, 1e-12)) to match the host kLogEps.
+cudaError_t launch_linear_precompute_tm(const float* A_g, const float* C, int Bn, int O, int K_m, int64_t C_off_M,
+                                        int64_t C_off_m, int t, bool use_utility, bool use_states_info_gain, float* dst,
+                                        cudaStream_t stream);
+
+// Device wA / wB (param-info-gain) repack, mirroring precompute_wA /
+// precompute_wB_transposed (neg_efe_precompute.h) — the Dirichlet weights from
+// pymdp.maths._exact_wnorm, rebuilt on device for the learning + novelty path.
+// wnorm_a reads pA per-modality [O, K_m] (strided by pA_batch_stride, offset
+// pA_mod_off) and writes wA in A's [O, K_m] layout (feed through
+// launch_a_rank3_cublas_view for rank-3). wnorm_b reads pB per-factor [S, K, U]
+// and writes the transposed (U, S, K) layout pack_b_factors consumes.
+cudaError_t launch_wnorm_a(const float* pA, int64_t pA_batch_stride, int64_t pA_mod_off, int Bn, int O, int K_m,
+                           float* wA, cudaStream_t stream);
+cudaError_t launch_wnorm_b(const float* pB, int64_t pB_batch_stride, int64_t pB_fac_off, int Bn, int S, int K, int U,
+                           float* wB, cudaStream_t stream);
 
 }  // namespace cuda_kernels
 }  // namespace pymdp_ffi

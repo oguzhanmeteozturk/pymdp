@@ -101,6 +101,12 @@ FfiError ensure_forward_scratch(NegEfeContext& ctx, const Layout& L, KernelFlags
     }
     CUDA_TRY("scratch split_tmp_lin",
              ctx.scratch.split_tmp_lin.ensure(ctx.tree_cache.split_tmp_lin_max_floats * sizeof(float)));
+    if (ctx.tree_cache.stacked_lin_in_max_floats > 0) {
+      CUDA_TRY("scratch stacked_lin_in",
+               ctx.scratch.stacked_lin_in.ensure(ctx.tree_cache.stacked_lin_in_max_floats * sizeof(float)));
+      CUDA_TRY("scratch stacked_lin_out",
+               ctx.scratch.stacked_lin_out.ensure(ctx.tree_cache.stacked_lin_out_max_floats * sizeof(float)));
+    }
     // Both q01_outer and tmp_qo_cublas are sized for the worst-case rank-2/3
     // modality (cache-fill pass takes the max across modalities).
     CUDA_TRY("scratch q01_outer", ctx.scratch.q01_outer.ensure(ctx.tree_cache.q01_outer_max_floats * sizeof(float)));

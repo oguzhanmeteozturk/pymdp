@@ -65,13 +65,9 @@ FfiError FpiCudaDevice(cudaStream_t stream, FfiF32Buf ll_flat_dev, FfiF32Buf lp_
   const int64_t total_S  = lp_offsets[F];
   const int64_t total_ll = ll_offsets[M];
   const int64_t lp_count = lp_flat_dev.element_count();
-  if (total_S <= 0 || lp_count <= 0 || lp_count % total_S != 0) {
-    return invalid_arg(kFpiKernelName, "lp_flat size = " + std::to_string(lp_count) +
-                                           " not divisible by total_S = " + std::to_string(total_S));
-  }
-  const int64_t batch = lp_count / total_S;
-  PYMDP_TRY(check_count(kFpiKernelName, "ll_flat", ll_flat_dev.element_count(), batch * total_ll));
-  PYMDP_TRY(check_count(kFpiKernelName, "q_out", q_out_dev->element_count(), batch * total_S));
+  int64_t       batch    = 0;
+  PYMDP_TRY(validate_fpi_batch_shapes(lp_count, ll_flat_dev.element_count(), q_out_dev->element_count(), total_S,
+                                      total_ll, &batch));
 
   // Diagnostic bypass (PYMDP_FFI_FPI_KERNEL_NOOP=1): launch empty kernel
   // with matching grid/block/shmem. Bench delta vs real launch isolates
@@ -88,11 +84,10 @@ FfiError FpiCudaDevice(cudaStream_t stream, FfiF32Buf ll_flat_dev, FfiF32Buf lp_
 
   if (use_smallmeta) {
     CUDA_TRY("fpi_cuda launch (smallmeta)",
-             fpi_cuda::launch_fpi_smallmeta(ll_flat_dev.typed_data(), lp_flat_dev.typed_data(),
-                                            q_out_dev->typed_data(), static_cast<int>(batch), static_cast<int>(F),
-                                            static_cast<int>(M), static_cast<int>(total_ll),
-                                            static_cast<int>(total_S), num_iter, cs->smallmeta, cs->sync_mask,
-                                            stream));
+             fpi_cuda::launch_fpi_smallmeta(ll_flat_dev.typed_data(), lp_flat_dev.typed_data(), q_out_dev->typed_data(),
+                                            static_cast<int>(batch), static_cast<int>(F), static_cast<int>(M),
+                                            static_cast<int>(total_ll), static_cast<int>(total_S), num_iter,
+                                            cs->smallmeta, cs->sync_mask, stream));
   } else {
     CUDA_TRY("fpi_cuda launch",
              fpi_cuda::launch_fpi(ll_flat_dev.typed_data(), lp_flat_dev.typed_data(), q_out_dev->typed_data(),

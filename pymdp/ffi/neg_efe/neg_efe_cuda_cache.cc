@@ -68,6 +68,26 @@ inline CuArr append_rank3_cublas_view(CuPool* pool, const std::vector<float>& pa
   return pool->append_copy(cublas_packed->data(), cublas_packed->size() * sizeof(float));
 }
 
+// Rank-3 modality geometry for the cuBLAS-permuted view. A rank-3 modality's
+// A block flattens (O_m, S0, S1, S_split); the view keeps (O_m, K_keep = S0*S1)
+// and splits out S_split (dep index 2). Non-rank-3 modalities report
+// is_rank3 == false and take an empty cuBLAS-view slot. Shared by the host pack
+// (CPU permute) and the device repack (kernel permute) so the dim extraction
+// lives in one place.
+struct Rank3ViewDims {
+  bool is_rank3 = false;
+  int  O_m      = 0;
+  int  K_keep   = 0;  // S0 * S1
+  int  S_split  = 0;  // dep index 2
+};
+
+inline Rank3ViewDims rank3_view_dims(const Layout& L, int m) {
+  const DependencyView deps = modality_state_deps(L, m);
+  if (deps.rank != 3) return {};
+  return {true, static_cast<int>(L.O[m]), dep_state_size(L, deps, 0) * dep_state_size(L, deps, 1),
+          dep_state_size(L, deps, 2)};
+}
+
 // Bytes needed in a CuPool for an A-shaped pack: per-modality A (always) +
 // rank-3 cuBLAS-permuted view (same size as A, rank-3 modalities only).
 inline size_t a_pack_pool_bytes(const Layout& L, int Bn) {
@@ -101,14 +121,10 @@ void pack_a_modalities(const Layout& L, int Bn, const float* src, CuPool* pool, 
   for (int m = 0; m < M; ++m) {
     const size_t per_batch = a_size(L, m);
     arrays->push_back(append_packed_slices(pool, pack_scratch, src, Bn, L.A_off[L.M], L.A_off[m], per_batch));
-    const DependencyView deps = modality_state_deps(L, m);
-    if (deps.rank == 3) {
-      const int O_m     = static_cast<int>(L.O[m]);
-      const int S_split = dep_state_size(L, deps, 2);
-      const int S0      = dep_state_size(L, deps, 0);
-      const int S1      = dep_state_size(L, deps, 1);
+    const Rank3ViewDims r3 = rank3_view_dims(L, m);
+    if (r3.is_rank3) {
       cublas_views->push_back(
-          append_rank3_cublas_view(pool, *pack_scratch, Bn, O_m, S0 * S1, S_split, per_batch, cublas_scratch));
+          append_rank3_cublas_view(pool, *pack_scratch, Bn, r3.O_m, r3.K_keep, r3.S_split, per_batch, cublas_scratch));
     } else {
       cublas_views->emplace_back();
     }
@@ -216,7 +232,7 @@ inline bool pm_is_broadcast(const int32_t* pm_base, int Bn, int P, int T, int F)
 // -----------------------------------------------------------------------------
 
 // Tree cache: per-(t, f) factor-history dedup + dependent index tables
-// (mod_offs, ind_offs, mod_h_dims, pmi, p2h_concat, scratch sizings).
+// (mod_offs, ind_offs, mod_h_dims, pmi, p2h, scratch sizings).
 // Broadcast precondition (pm equal across batch) is enforced on miss.
 FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int32_t* pm_base) {
   const int      P              = static_cast<int>(L.P);
@@ -268,11 +284,12 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
   ctx.tree_cache.ind_score_offsets_dev        = std::move(ind_off_dev);
   ctx.tree_cache.total_mod_entries            = tables.total_mod_entries;
   ctx.tree_cache.total_ind_entries            = tables.total_factor_entries;
-  ctx.tree_cache.H_max_per_factor_max         = tables.max_history_count;
   ctx.tree_cache.mod_h_dims                   = std::move(tables.mod_h_dims);
   ctx.tree_cache.modality_tmp_qo_max_floats   = tables.modality_tmp_qo_max_floats;
   ctx.tree_cache.split_tmp_lin_max_floats     = tables.split_tmp_lin_max_floats;
   ctx.tree_cache.q01_outer_max_floats         = tables.q01_outer_max_floats;
+  ctx.tree_cache.stacked_lin_in_max_floats    = tables.stacked_lin_in_max_floats;
+  ctx.tree_cache.stacked_lin_out_max_floats   = tables.stacked_lin_out_max_floats;
   ctx.tree_cache.factor_S_dev                 = std::move(meta.S_dev);
   ctx.tree_cache.factor_depth_dev             = std::move(meta.depth_dev);
   ctx.tree_cache.factor_qs_off_dev            = std::move(meta.qs_off_dev);
@@ -281,41 +298,65 @@ FfiError fill_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int3
   return FfiError::Success();
 }
 
+// Host-side per-cache fill skeleton shared by the raw (A / B) and param-info-
+// gain (wA / wB) caches: short-circuit on a content-tag + layout-sig hit, else
+// reserve the pool, run `pack` to materialize the device slices, and store.
+// `pack` supplies the source data (raw A/B, or precomputed wA/wB) and is only
+// invoked on a miss — so the wA/wB per-batch precompute never runs on a hit.
+
+// A-shaped (A / wA): `pack(pool, arrays, cublas_views)` writes both the
+// per-modality slices and the rank-3 cuBLAS-permuted views.
+template <typename Pack>
+FfiError fill_a_shaped_cache(CudaACache& cache, const Layout& L, int Bn, int64_t total_size, uint64_t tag,
+                             uint64_t sig, const char* pool_op, Pack&& pack) {
+  if (cache.match(tag, total_size, sig)) return FfiError::Success();
+  CuPool pool;
+  CUDA_TRY(pool_op, pool.reserve(a_pack_pool_bytes(L, Bn)));
+  CuArrVec arrays, cublas_views;
+  pack(pool, arrays, cublas_views);
+  cache.store(tag, total_size, sig, std::move(pool), std::move(arrays), std::move(cublas_views));
+  return FfiError::Success();
+}
+
+// B-shaped (B / wB): `pack(pool, arrays)` writes the per-factor slices only.
+template <typename Pack>
+FfiError fill_b_shaped_cache(CudaArrayCache& cache, const Layout& L, int Bn, int64_t total_size, uint64_t tag,
+                             uint64_t sig, const char* pool_op, Pack&& pack) {
+  if (cache.match(tag, total_size, sig)) return FfiError::Success();
+  CuPool pool;
+  CUDA_TRY(pool_op, pool.reserve(b_pack_pool_bytes(L, Bn)));
+  CuArrVec arrays;
+  pack(pool, arrays);
+  cache.store(tag, total_size, sig, std::move(pool), std::move(arrays));
+  return FfiError::Success();
+}
+
 // A cache: per-modality [Bn, O_m, K_m] + cuBLAS-permuted view for rank-3.
-// Returns A_tag for the downstream linear-cache key.
+// Returns A_tag for the downstream linear-cache key (set even on a cache hit).
 FfiError fill_a_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* A_base, uint64_t* A_tag_out) {
   const int64_t  A_total_size = static_cast<int64_t>(Bn) * L.A_off[L.M];
   const uint64_t A_tag        = content_tag(A_base, A_total_size);
-  const uint64_t A_sig        = a_sig_bn(L, Bn);
   *A_tag_out                  = A_tag;
-
-  if (ctx.a_cache.match(A_tag, A_total_size, A_sig)) return FfiError::Success();
-
-  CuPool pool;
-  CUDA_TRY("a_pool_reserve", pool.reserve(a_pack_pool_bytes(L, Bn)));
-  CuArrVec arrays, cublas_views;
-  pack_a_modalities(L, Bn, A_base, &pool, &arrays, &cublas_views, &g_cuda_host_pack_scratch,
-                    &g_cuda_host_pack_scratch_alt);
-  ctx.a_cache.store(A_tag, A_total_size, A_sig, std::move(pool), std::move(arrays), std::move(cublas_views));
-  return FfiError::Success();
+  return fill_a_shaped_cache(ctx.a_cache, L, Bn, A_total_size, A_tag, a_sig_bn(L, Bn), "a_pool_reserve",
+                             [&](CuPool& pool, CuArrVec& arrays, CuArrVec& cublas_views) {
+                               pack_a_modalities(L, Bn, A_base, &pool, &arrays, &cublas_views,
+                                                 &g_cuda_host_pack_scratch, &g_cuda_host_pack_scratch_alt);
+                             });
 }
 
 // B cache: per-factor [Bn, S_f, K_f, U_f]; K_f = product of B-dep state sizes.
 FfiError fill_b_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* B_base) {
   const int64_t  B_total_size = static_cast<int64_t>(Bn) * L.B_off[L.F];
   const uint64_t B_tag        = content_tag(B_base, B_total_size);
-  const uint64_t B_sig        = b_sig_bn(L, Bn);
-
-  if (ctx.b_cache.match(B_tag, B_total_size, B_sig)) return FfiError::Success();
-
-  CuPool pool;
-  CUDA_TRY("b_pool_reserve", pool.reserve(b_pack_pool_bytes(L, Bn)));
-  CuArrVec arrays;
-  pack_b_factors(L, Bn, B_base, &pool, &arrays, &g_cuda_host_pack_scratch);
-  ctx.b_cache.store(B_tag, B_total_size, B_sig, std::move(pool), std::move(arrays));
-  return FfiError::Success();
+  return fill_b_shaped_cache(ctx.b_cache, L, Bn, B_total_size, B_tag, b_sig_bn(L, Bn), "b_pool_reserve",
+                             [&](CuPool& pool, CuArrVec& arrays) {
+                               pack_b_factors(L, Bn, B_base, &pool, &arrays, &g_cuda_host_pack_scratch);
+                             });
 }
 
+// wA cache: precompute wA per batch into a contiguous [Bn, A_total] buffer,
+// then pack just like raw A. `_alt` holds the cross-batch precompute, so the
+// rank-3 cuBLAS permute uses a local scratch (touched only for rank-3).
 FfiError fill_wa_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* pA_base, bool pA_present) {
   if (!pA_present) {
     ctx.wa_cache.clear();
@@ -323,30 +364,22 @@ FfiError fill_wa_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
   }
   const int64_t  A_total_size = static_cast<int64_t>(Bn) * L.A_off[L.M];
   const uint64_t pA_tag       = content_tag(pA_base, A_total_size);
-  const uint64_t pA_sig       = a_sig_bn(L, Bn);
-  if (ctx.wa_cache.match(pA_tag, A_total_size, pA_sig)) return FfiError::Success();
-
-  CuPool pool;
-  CUDA_TRY("wa_pool_reserve", pool.reserve(a_pack_pool_bytes(L, Bn)));
-
-  // Precompute wA per batch into a contiguous [Bn, A_total] buffer, then
-  // hand it to pack_a_modalities just like raw A. `_alt` holds the cross-
-  // batch precompute, so the rank-3 cuBLAS permute uses a local scratch
-  // (only touched when at least one modality is rank-3).
-  std::vector<float>& all_wA = g_cuda_host_pack_scratch_alt;
-  all_wA.assign(static_cast<size_t>(Bn) * L.A_off[L.M], 0.0f);
-  for (int b = 0; b < Bn; ++b) {
-    const std::vector<float> wA_b = precompute_wA(L, pA_base + static_cast<int64_t>(b) * L.A_off[L.M]);
-    std::memcpy(all_wA.data() + static_cast<size_t>(b) * L.A_off[L.M], wA_b.data(), wA_b.size() * sizeof(float));
-  }
-
-  CuArrVec           arrays, cublas_views;
-  std::vector<float> cublas_scratch;
-  pack_a_modalities(L, Bn, all_wA.data(), &pool, &arrays, &cublas_views, &g_cuda_host_pack_scratch, &cublas_scratch);
-  ctx.wa_cache.store(pA_tag, A_total_size, pA_sig, std::move(pool), std::move(arrays), std::move(cublas_views));
-  return FfiError::Success();
+  return fill_a_shaped_cache(
+      ctx.wa_cache, L, Bn, A_total_size, pA_tag, a_sig_bn(L, Bn), "wa_pool_reserve",
+      [&](CuPool& pool, CuArrVec& arrays, CuArrVec& cublas_views) {
+        std::vector<float>& all_wA = g_cuda_host_pack_scratch_alt;
+        all_wA.assign(static_cast<size_t>(Bn) * L.A_off[L.M], 0.0f);
+        for (int b = 0; b < Bn; ++b) {
+          const std::vector<float> wA_b = precompute_wA(L, pA_base + static_cast<int64_t>(b) * L.A_off[L.M]);
+          std::memcpy(all_wA.data() + static_cast<size_t>(b) * L.A_off[L.M], wA_b.data(), wA_b.size() * sizeof(float));
+        }
+        std::vector<float> cublas_scratch;
+        pack_a_modalities(L, Bn, all_wA.data(), &pool, &arrays, &cublas_views, &g_cuda_host_pack_scratch,
+                          &cublas_scratch);
+      });
 }
 
+// wB cache: precompute wB (transposed layout) per batch, then pack like raw B.
 FfiError fill_wb_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float* pB_base, bool pB_present) {
   if (!pB_present) {
     ctx.wb_cache.clear();
@@ -354,26 +387,18 @@ FfiError fill_wb_cache(NegEfeContext& ctx, const Layout& L, int Bn, const float*
   }
   const int64_t  B_total_size = static_cast<int64_t>(Bn) * L.B_off[L.F];
   const uint64_t pB_tag       = content_tag(pB_base, B_total_size);
-  const uint64_t pB_sig       = b_sig_bn(L, Bn);
-  if (ctx.wb_cache.match(pB_tag, B_total_size, pB_sig)) return FfiError::Success();
-
-  CuPool pool;
-  CUDA_TRY("wb_pool_reserve", pool.reserve(b_pack_pool_bytes(L, Bn)));
-
-  // Precompute wB (transposed layout) per batch, then hand the [Bn, B_total]
-  // buffer to pack_b_factors.
-  std::vector<float>& all_wB = g_cuda_host_pack_scratch_alt;
-  all_wB.assign(static_cast<size_t>(Bn) * L.B_off[L.F], 0.0f);
-  for (int b = 0; b < Bn; ++b) {
-    const TransposedB wB_b = precompute_wB_transposed(L, pB_base + static_cast<int64_t>(b) * L.B_off[L.F]);
-    std::memcpy(all_wB.data() + static_cast<size_t>(b) * L.B_off[L.F], wB_b.data.data(),
-                wB_b.data.size() * sizeof(float));
-  }
-
-  CuArrVec arrays;
-  pack_b_factors(L, Bn, all_wB.data(), &pool, &arrays, &g_cuda_host_pack_scratch);
-  ctx.wb_cache.store(pB_tag, B_total_size, pB_sig, std::move(pool), std::move(arrays));
-  return FfiError::Success();
+  return fill_b_shaped_cache(
+      ctx.wb_cache, L, Bn, B_total_size, pB_tag, b_sig_bn(L, Bn), "wb_pool_reserve",
+      [&](CuPool& pool, CuArrVec& arrays) {
+        std::vector<float>& all_wB = g_cuda_host_pack_scratch_alt;
+        all_wB.assign(static_cast<size_t>(Bn) * L.B_off[L.F], 0.0f);
+        for (int b = 0; b < Bn; ++b) {
+          const TransposedB wB_b = precompute_wB_transposed(L, pB_base + static_cast<int64_t>(b) * L.B_off[L.F]);
+          std::memcpy(all_wB.data() + static_cast<size_t>(b) * L.B_off[L.F], wB_b.data.data(),
+                      wB_b.data.size() * sizeof(float));
+        }
+        pack_b_factors(L, Bn, all_wB.data(), &pool, &arrays, &g_cuda_host_pack_scratch);
+      });
 }
 
 // Bytes needed in a CuPool for the per-(t, m) linear cache.
@@ -427,7 +452,7 @@ FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flag
   const int64_t  C_total_size = static_cast<int64_t>(Bn) * L.C_off[L.M];
   const uint64_t C_tag        = flags.use_utility ? content_tag(C_base, C_total_size) : 0;
   const uint64_t linear_sig   = cuda_linear_sig(L, Bn);
-  const int32_t  flag_bits    = (flags.use_states_info_gain ? 1 : 0) | (flags.use_utility ? 2 : 0);
+  const int32_t  flag_bits    = linear_flag_bits(flags);
   if (ctx.linear_cache.match(A_tag, C_tag, linear_sig, flag_bits)) {
     return FfiError::Success();
   }
@@ -465,6 +490,67 @@ FfiError fill_linear_cache(NegEfeContext& ctx, const Layout& L, KernelFlags flag
   return FfiError::Success();
 }
 
+// -----------------------------------------------------------------------------
+// Device-side cache rebuild (learning repack path). Both the raw A/B caches and
+// the param-info-gain wA/wB caches walk the same skeleton — reserve the pool,
+// fill one device slice per modality/factor, build the rank-3 cuBLAS view for
+// A-shaped caches, then set the key. Only the per-slice device op differs (a
+// D2D gather for A/B vs an on-device wnorm for wA/wB), so it is supplied as a
+// `fill_slice` callable while the skeleton lives here once.
+// -----------------------------------------------------------------------------
+
+// A-shaped cache (A / wA): per-modality [Bn, a_size(m)] slice + rank-3 cuBLAS
+// view. `fill_slice(m, O, K_m, slice)` writes modality m's payload.
+template <typename FillSlice>
+FfiError rebuild_a_shaped_cache_device(CudaACache& ac, const Layout& L, int Bn, uint64_t repack_tag,
+                                       const char* pool_op, const char* rank3_op, cudaStream_t stream,
+                                       FillSlice&& fill_slice) {
+  const int M = static_cast<int>(L.M);
+  CUDA_TRY(pool_op, ac.pool.reserve(a_pack_pool_bytes(L, Bn)));
+  ac.arrays.clear();
+  ac.cublas_views.clear();
+  ac.arrays.reserve(M);
+  ac.cublas_views.reserve(M);
+  for (int m = 0; m < M; ++m) {
+    const int    O           = static_cast<int>(L.O[m]);
+    const int    K_m         = static_cast<int>(a_size(L, m) / O);
+    const size_t slice_bytes = static_cast<size_t>(Bn) * a_size(L, m) * sizeof(float);
+    CuArr        slice       = ac.pool.append_reserve(slice_bytes);
+    PYMDP_TRY(fill_slice(m, O, K_m, slice));
+    ac.arrays.push_back(std::move(slice));
+    const Rank3ViewDims r3 = rank3_view_dims(L, m);
+    if (r3.is_rank3) {
+      CuArr cb = ac.pool.append_reserve(slice_bytes);
+      CUDA_TRY(rank3_op, cuda_kernels::launch_a_rank3_cublas_view(ac.arrays.back().as<const float>(), Bn, r3.O_m,
+                                                                  r3.K_keep, r3.S_split, cb.as<float>(), stream));
+      ac.cublas_views.push_back(std::move(cb));
+    } else {
+      ac.cublas_views.emplace_back();
+    }
+  }
+  ac.key.set(repack_tag, static_cast<int64_t>(Bn) * L.A_off[L.M], a_sig_bn(L, Bn));
+  return FfiError::Success();
+}
+
+// B-shaped cache (B / wB): per-factor [Bn, b_size(f)] slice, no cuBLAS view.
+// `fill_slice(f, slice)` writes factor f's payload.
+template <typename FillSlice>
+FfiError rebuild_b_shaped_cache_device(CudaArrayCache& bc, const Layout& L, int Bn, uint64_t repack_tag,
+                                       const char* pool_op, cudaStream_t stream, FillSlice&& fill_slice) {
+  const int F = static_cast<int>(L.F);
+  CUDA_TRY(pool_op, bc.pool.reserve(b_pack_pool_bytes(L, Bn)));
+  bc.arrays.clear();
+  bc.arrays.reserve(F);
+  for (int f = 0; f < F; ++f) {
+    const size_t per_batch = b_size(L, f);
+    CuArr        slice      = bc.pool.append_reserve(static_cast<size_t>(Bn) * per_batch * sizeof(float));
+    PYMDP_TRY(fill_slice(f, slice));
+    bc.arrays.push_back(std::move(slice));
+  }
+  bc.key.set(repack_tag, static_cast<int64_t>(Bn) * L.B_off[L.F], b_sig_bn(L, Bn));
+  return FfiError::Success();
+}
+
 }  // namespace
 
 FfiError prepare_caches(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const int32_t* pm_base,
@@ -482,6 +568,106 @@ FfiError prepare_caches(NegEfeContext& ctx, const Layout& L, KernelFlags flags, 
     ctx.wb_cache.clear();
   }
   PYMDP_TRY(fill_linear_cache(ctx, L, flags, Bn, A_base, C_base, A_tag));
+  return FfiError::Success();
+}
+
+FfiError prepare_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int32_t* pm_base) {
+  return fill_tree_cache(ctx, L, Bn, pm_base);
+}
+
+FfiError prepare_caches_device(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const float* A_dev,
+                               const float* B_dev, const float* C_dev, const float* pA_dev, const float* pB_dev,
+                               uint64_t repack_tag, cudaStream_t stream) {
+  const int M = static_cast<int>(L.M);
+  const int T = static_cast<int>(L.T);
+
+  // Each cache is rebuilt into its own resident pool: reserve() reuses the
+  // existing managed backing when the size is unchanged (it is, every learning
+  // step), so there is no per-step cudaMallocManaged/cudaFree. The prior step's
+  // forward pass and this step's repack are on the same stream, so overwriting
+  // the backing is safely ordered after those reads complete.
+
+  // --- A cache: per-modality strided slice (D2D) + rank-3 cuBLAS-view permute.
+  // Gather A[:, A_off[m] : A_off[m]+per_batch] (src batch stride A_off[M]) into a
+  // contiguous [Bn, per_batch] slice — bit-identical to pack_batched_slices.
+  PYMDP_TRY(rebuild_a_shaped_cache_device(
+      ctx.a_cache, L, Bn, repack_tag, "a_dev_pool_reserve", "a_dev_rank3_view", stream,
+      [&](int m, int /*O*/, int /*K_m*/, CuArr& slice) -> FfiError {
+        const size_t per_batch = a_size(L, m);
+        return cuda_err(kEfeKernelName, "a_dev_gather",
+                        cudaMemcpy2DAsync(slice.ptr, per_batch * sizeof(float), A_dev + L.A_off[m],
+                                          static_cast<size_t>(L.A_off[L.M]) * sizeof(float), per_batch * sizeof(float),
+                                          Bn, cudaMemcpyDeviceToDevice, stream));
+      }));
+
+  // --- B cache: per-factor strided slice (D2D).
+  PYMDP_TRY(rebuild_b_shaped_cache_device(
+      ctx.b_cache, L, Bn, repack_tag, "b_dev_pool_reserve", stream, [&](int f, CuArr& slice) -> FfiError {
+        const size_t per_batch = b_size(L, f);
+        return cuda_err(kEfeKernelName, "b_dev_gather",
+                        cudaMemcpy2DAsync(slice.ptr, per_batch * sizeof(float), B_dev + L.B_off[f],
+                                          static_cast<size_t>(L.B_off[L.F]) * sizeof(float), per_batch * sizeof(float),
+                                          Bn, cudaMemcpyDeviceToDevice, stream));
+      }));
+
+  // --- param-info-gain wA / wB: on-device wnorm repack (mirrors
+  // precompute_wA / precompute_wB_transposed). Cleared when the flag is off or
+  // the buffer is absent. wA lands in A's packed layout (+ rank-3 cuBLAS view);
+  // wB in the transposed (U, S, K) layout pack_b_factors produces.
+  if (flags.use_param_info_gain && pA_dev != nullptr) {
+    PYMDP_TRY(rebuild_a_shaped_cache_device(
+        ctx.wa_cache, L, Bn, repack_tag, "wa_dev_pool_reserve", "wa_dev_rank3_view", stream,
+        [&](int m, int O, int K_m, CuArr& slice) -> FfiError {
+          return cuda_err(kEfeKernelName, "wa_dev_wnorm",
+                          cuda_kernels::launch_wnorm_a(pA_dev, L.A_off[L.M], L.A_off[m], Bn, O, K_m, slice.as<float>(),
+                                                       stream));
+        }));
+  } else {
+    ctx.wa_cache.clear();
+  }
+
+  if (flags.use_param_info_gain && pB_dev != nullptr) {
+    PYMDP_TRY(rebuild_b_shaped_cache_device(
+        ctx.wb_cache, L, Bn, repack_tag, "wb_dev_pool_reserve", stream, [&](int f, CuArr& slice) -> FfiError {
+          const int S = static_cast<int>(L.S[f]);
+          const int U = static_cast<int>(L.U[f]);
+          const int K = static_cast<int>(b_K(L, f));
+          return cuda_err(kEfeKernelName, "wb_dev_wnorm",
+                          cuda_kernels::launch_wnorm_b(pB_dev, L.B_off[L.F], L.B_off[f], Bn, S, K, U, slice.as<float>(),
+                                                       stream));
+        }));
+  } else {
+    ctx.wb_cache.clear();
+  }
+
+  // --- Linear cache: per-(t, m) [Bn, K_m], reads the just-gathered device A.
+  const int32_t flag_bits = linear_flag_bits(flags);
+  if (flag_bits == 0) {
+    ctx.linear_cache.store_empty(repack_tag, repack_tag, cuda_linear_sig(L, Bn), flag_bits);
+    return FfiError::Success();
+  }
+  CudaLinearCache& lc = ctx.linear_cache;
+  CUDA_TRY("linear_dev_pool_reserve", lc.pool.reserve(linear_pool_bytes(L, Bn)));
+  lc.per_tm.clear();
+  lc.per_tm.resize(T);  // default-constructs T empty rows (CuArr is move-only)
+  for (int t = 0; t < T; ++t) {
+    lc.per_tm[t].reserve(M);
+    for (int m = 0; m < M; ++m) {
+      const int O     = static_cast<int>(L.O[m]);
+      const int K_m   = static_cast<int>(a_size(L, m) / O);
+      CuArr     slice = lc.pool.append_reserve(static_cast<size_t>(Bn) * K_m * sizeof(float));
+      CUDA_TRY("linear_dev_precompute",
+               cuda_kernels::launch_linear_precompute_tm(ctx.a_cache.arrays[m].as<const float>(), C_dev, Bn, O, K_m,
+                                                         L.C_off[L.M], L.C_off[m], t, flags.use_utility,
+                                                         flags.use_states_info_gain, slice.as<float>(), stream));
+      lc.per_tm[t].push_back(std::move(slice));
+    }
+  }
+  lc.a_tag      = repack_tag;
+  lc.c_tag      = repack_tag;
+  lc.layout_sig = cuda_linear_sig(L, Bn);
+  lc.flags      = flag_bits;
+  lc.valid      = true;
   return FfiError::Success();
 }
 

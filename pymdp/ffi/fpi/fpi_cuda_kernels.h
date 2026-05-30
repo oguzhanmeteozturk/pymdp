@@ -55,8 +55,7 @@ cudaError_t launch_fpi(const float* ll_flat,  // [batch, total_ll]
                        const int32_t*             S,           // [F]
                        const int32_t*             lp_offsets,  // [F]
                        const ModalityDispatchGpu* mods,        // [M]
-                       uint32_t                   sync_mask,
-                       cudaStream_t               stream);
+                       uint32_t sync_mask, cudaStream_t stream);
 
 // Diagnostic: empty kernel with the same grid/block/shmem as launch_fpi.
 // Used by PYMDP_FFI_FPI_KERNEL_NOOP in FpiCudaDevice; diff vs launch_fpi
@@ -83,8 +82,8 @@ struct FpiSmallMeta {
 };
 
 cudaError_t launch_fpi_smallmeta(const float* ll_flat, const float* lp_flat, float* q_out, int batch, int F, int M,
-                                 int total_ll, int total_S, int num_iter, const FpiSmallMeta& meta,
-                                 uint32_t sync_mask, cudaStream_t stream);
+                                 int total_ll, int total_S, int num_iter, const FpiSmallMeta& meta, uint32_t sync_mask,
+                                 cudaStream_t stream);
 
 }  // namespace fpi_cuda
 }  // namespace pymdp_ffi

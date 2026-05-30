@@ -81,9 +81,12 @@ if(_pymdp_ffi_build_cuda)
         neg_efe/neg_efe_cuda_launch.cc
         neg_efe/neg_efe_cuda_runtime.cc
         neg_efe/neg_efe_cuda_kernels.cu
+        neg_efe/neg_efe_cuda_context.h
+        neg_efe/neg_efe_cuda_internal.h
         fpi/fpi_cuda_cache.cc
         fpi/fpi_cuda_host_shim.cc
         fpi/fpi_cuda_kernels.cu
+        fpi/fpi_cuda_kernels.h
         fpi/fpi_cuda_runtime.cc
     )
 endif()

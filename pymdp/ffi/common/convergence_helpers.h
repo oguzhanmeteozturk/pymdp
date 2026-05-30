@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "common/fpi_convergence_tol.h"  // kFpiConvergenceTol (shared with CUDA path)
 #include "common/kernel_primitives.h"
 
 namespace pymdp_ffi {
@@ -73,16 +74,5 @@ inline float max_abs_diff(const float* __restrict__ a, const float* __restrict__
   }
   return m;
 }
-
-// Hard-coded FPI early-stop tolerance: after each body iter, the kernel
-// computes `max|log_q - log_q_prev|` and breaks once below this. Empirically
-// chosen at 1e-5 — well below test_fpi_ffi.py's parity atol of 1e-6 (max
-// observed |q - q_ref| was 2.7e-7 across all fixtures), still loose enough
-// to fire on small/easy shapes (fpi_inference, fpi_high_rank). Larger
-// problems (fpi_large) don't converge to this threshold within typical
-// num_iter=16 and run the full loop. Cost when not firing: one memcpy +
-// max-abs-diff per iter, ~5% of per-iter cost — recouped many times over
-// when it does.
-constexpr float kFpiConvergenceTol = 1e-5f;
 
 }  // namespace pymdp_ffi

@@ -39,9 +39,10 @@ struct CudaCacheKey {
   }
 };
 
-// Device source pointers for the current call's model inputs. Consumed by the
-// CUDA-Dev warm check (caches_are_warm) as the gather sources for the content
-// fingerprint. nullptr marks an absent optional buffer (C / pA / pB).
+// Device source pointers for the current call's model inputs. The CUDA-Dev warm
+// check (caches_are_warm) compares these against the recorded cold-fill sources
+// (warm_devs) for the kFlagModelParamsStatic devptr fast path. nullptr marks an
+// absent optional buffer (C / pA / pB).
 struct DevSrcs {
   const void* pm = nullptr;
   const void* A  = nullptr;
@@ -51,17 +52,16 @@ struct DevSrcs {
   const void* pB = nullptr;
 };
 
-struct CudaArrayCache {
+// Shared device-cache state: a content/layout key, the backing pool, and the
+// per-modality/factor device slices. `match()` and `clear()` are common to
+// every model-param cache; the two concrete caches below add their own
+// `store()` (differing only in arity) plus any extra parallel arrays.
+struct CudaCacheBase {
   CudaCacheKey key;
   CuPool       pool;
   CuArrVec     arrays;
 
   bool match(uint64_t tag, int64_t sz, uint64_t sig) const { return key.match(tag, sz, sig) && !arrays.empty(); }
-  void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built) {
-    pool   = std::move(built_pool);
-    arrays = std::move(built);
-    key.set(tag, sz, sig);
-  }
   void clear() {
     pool.reset();
     arrays.clear();
@@ -69,13 +69,20 @@ struct CudaArrayCache {
   }
 };
 
-struct CudaACache {
-  CudaCacheKey key;
-  CuPool       pool;
-  CuArrVec     arrays;
-  CuArrVec     cublas_views;
+// Plain array cache (B / wB): pool + per-factor slices, nothing else.
+struct CudaArrayCache : CudaCacheBase {
+  void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built) {
+    pool   = std::move(built_pool);
+    arrays = std::move(built);
+    key.set(tag, sz, sig);
+  }
+};
 
-  bool match(uint64_t tag, int64_t sz, uint64_t sig) const { return key.match(tag, sz, sig) && !arrays.empty(); }
+// A-shaped cache (A / wA): adds the rank-3 cuBLAS-permuted views that run
+// parallel to `arrays` (a default-constructed slot for non-rank-3 modalities).
+struct CudaACache : CudaCacheBase {
+  CuArrVec cublas_views;
+
   void store(uint64_t tag, int64_t sz, uint64_t sig, CuPool built_pool, CuArrVec built, CuArrVec built_cublas) {
     pool         = std::move(built_pool);
     arrays       = std::move(built);
@@ -83,10 +90,8 @@ struct CudaACache {
     key.set(tag, sz, sig);
   }
   void clear() {
-    pool.reset();
-    arrays.clear();
+    CudaCacheBase::clear();
     cublas_views.clear();
-    key = CudaCacheKey{};
   }
 };
 
@@ -127,14 +132,15 @@ struct FactorHistoryCache {
   FfiInt64Vec ind_score_offsets;
   CuArr       mod_score_offsets_dev;
   CuArr       ind_score_offsets_dev;
-  int64_t     total_mod_entries    = 0;
-  int64_t     total_ind_entries    = 0;
-  int         H_max_per_factor_max = 0;
+  int64_t     total_mod_entries = 0;
+  int64_t     total_ind_entries = 0;
 
   FfiInt32Vec mod_h_dims;
   size_t      modality_tmp_qo_max_floats = 0;
   size_t      split_tmp_lin_max_floats   = 0;
   size_t      q01_outer_max_floats       = 0;
+  size_t      stacked_lin_in_max_floats  = 0;
+  size_t      stacked_lin_out_max_floats = 0;
 
   CuArr   factor_S_dev;
   CuArr   factor_depth_dev;
@@ -144,8 +150,6 @@ struct FactorHistoryCache {
 
   bool match(uint64_t tag, int64_t sz, uint64_t sig) const { return key.match(tag, sz, sig) && !factor_tree.empty(); }
 };
-
-using CudaTreeCache = FactorHistoryCache;
 
 struct CudaScratch {
   CuArrVec qs_init_per_factor;
@@ -159,13 +163,13 @@ struct CudaScratch {
   CuArr    q01_outer;
   CuArr    tmp_qo_cublas;
   CuArr    tmp_wa_cublas;
-  CuArr    factor_scores;
-  CuArr    out_dev;
-  // Content-tag gather scratch for the CUDA-Dev warm check. Managed memory
-  // so the host can read the gathered 32-bit words after one stream sync.
-  // Sized for the 6 fingerprinted buffers (pm, A, B, C, pA, pB) at
-  // kContentTagTotalSamples 4-byte words each = 576 bytes.
-  CuArr    content_tag_dev;
+  // Dependency-group batched rank-2 linear term: stacked_lin_in[Bn, G, K_d]
+  // gathers the group's linear vectors, one cuBLAS GEMM writes
+  // stacked_lin_out[Bn, G, H_kk]; each modality's finish reads its G-row slice.
+  CuArr stacked_lin_in;
+  CuArr stacked_lin_out;
+  CuArr factor_scores;
+  CuArr out_dev;
 };
 
 inline thread_local std::vector<float> g_cuda_host_pack_scratch;
@@ -190,6 +194,22 @@ struct NegEfeContext {
   CudaLinearCache    linear_cache;
   CudaScratch        scratch;
   CublasHandleHolder cublas_handle;
+
+  // Device source pointers captured at the last successful cold fill (the param
+  // instance currently resident in the caches). Used only by the
+  // kFlagModelParamsStatic warm-check fast path: when the caller guarantees the
+  // params are not mutated in place, devptr identity against these is a correct,
+  // sync-free warm test (the sole failure mode of devptr identity is in-place
+  // mutation, which the flag rules out). `warm_devs_valid` is false until a cold
+  // fill populates it and is reset whenever the caches are torn down.
+  DevSrcs warm_devs;
+  bool    warm_devs_valid = false;
+
+  // Monotonic sentinel used as the content_tag for caches rebuilt by the device
+  // repack path (prepare_caches_device). Each learning rebuild gets a distinct
+  // key so any later warm check misses and rebuilds rather than risking a stale
+  // hit; the device path itself never consults these tags (it force-rebuilds).
+  uint64_t repack_counter = 0;
 };
 
 }  // namespace pymdp_ffi

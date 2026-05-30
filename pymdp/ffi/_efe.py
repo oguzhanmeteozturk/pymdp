@@ -13,6 +13,7 @@ import numpy as np
 from ._core import (
     _register,
     _register_multistage,
+    cuda_platform_allowed_by_env,
     dep_indices_in_range,
     dep_list_rank_ok,
     ffi_capabilities,
@@ -26,10 +27,24 @@ FLAG_USE_UTILITY = 1 << 0
 FLAG_USE_STATES_INFO_GAIN = 1 << 1
 FLAG_USE_INDUCTIVE = 1 << 2
 FLAG_USE_PARAM_INFO_GAIN = 1 << 3
+# Caller guarantees the model params (A, B, C, pA, pB, policy_matrix) are not
+# mutated in place across calls (no learning step rewrites the donated A/B
+# buffers). Lets the CUDA-Dev warm check trust devptr identity and reuse the
+# resident caches. Clear (the default) means "no such guarantee": the CUDA-Dev
+# cold path rebuilds the A/B/linear caches from the device buffers every call
+# (always correct — never stale), which is also the learning regime. No effect
+# on the CPU/host path (it keys caches on a host content tag).
+FLAG_MODEL_PARAMS_STATIC = 1 << 4
 
 _NEG_EFE_STATE_TYPE_NAME = "pymdp_neg_efe_state"
 _NEG_EFE_STATE_TYPE_ID = "pymdp_neg_efe_state_type_id"
 _NEG_EFE_STATE_TYPE_INFO = "pymdp_neg_efe_state_type_info"
+
+# The CUDA modality-scoring path only has rank-1/2/3 kernels (see
+# neg_efe_cuda_launch.cc::launch_modality_scores); rank>=4 hard-errors. The CPU
+# path handles arbitrary rank, so this cap only gates the CUDA target — rank>=4
+# A-deps fall back to JAX (CUDA host) / CPU FFI (CPU host).
+CUDA_MODALITY_MAX_RANK = 3
 
 
 def _register_neg_efe_state_multistage(
@@ -77,6 +92,19 @@ def _register_all_efe_targets_eager() -> None:
     caps = ffi_capabilities()
     if not caps.get("cuda", False):
         return
+    # `JAX_PLATFORMS=cpu` (or any value omitting cuda/gpu) tells JAX not to
+    # initialize the CUDA platform table at all. Registering FFI handlers
+    # at platform="CUDA" against a missing platform leaves orphaned entries
+    # that the subsequent CPU backend init rejects with the same
+    # "Types used by FFI handlers must be registered before the handler
+    # registration" precondition we documented below. Skip every CUDA-keyed
+    # registration in that case — including the cuda_host stage that's
+    # nominally platform="cpu", since it shares the NegEfeState type with
+    # cuda_dev and the historical hazard is the TypeRegistry being only
+    # half-populated. CPU-only paths still go through the plain
+    # `pymdp_neg_efe_all_policies` target registered above.
+    if not cuda_platform_allowed_by_env():
+        return
     # CUDA-host multi-stage target (platform="cpu") and CUDA-dev multi-stage
     # target (platform="CUDA"). We intentionally do NOT gate on
     # has_jax_cuda_backend() here: that helper calls jax.devices() which
@@ -116,13 +144,13 @@ class RooflineParams:
     editing `_ORIN_ROOFLINE` (or pass a `RooflineParams` to the model fn).
     """
 
-    f_gpu: float          # CUDA-kernel f32 throughput (cuBLAS-staged contractions)
-    bw_gpu: float         # CUDA-path device bandwidth
-    launch_base_ms: float       # fixed CUDA dispatch + scatter overhead
+    f_gpu: float  # CUDA-kernel f32 throughput (cuBLAS-staged contractions)
+    bw_gpu: float  # CUDA-path device bandwidth
+    launch_base_ms: float  # fixed CUDA dispatch + scatter overhead
     launch_per_stage_ms: float  # added latency per (modality | factor) stage
-    f_xla: float          # fused-vmap throughput (XLA's generic fusion)
-    bw_xla: float         # fused-vmap bandwidth
-    fixed_xla_ms: float         # fused-vmap fixed dispatch
+    f_xla: float  # fused-vmap throughput (XLA's generic fusion)
+    bw_xla: float  # fused-vmap bandwidth
+    fixed_xla_ms: float  # fused-vmap fixed dispatch
 
 
 # Fit to an Orin bench sweep: the inductive winner (1.29e9 flop, M+F=6) lands at
@@ -183,8 +211,8 @@ def neg_efe_ffi_beneficial(
     if M < 1 or F < 1:
         return None
 
-    a_vol = 0          # sum_m O_m * prod S over A-deps  (A read volume / step)
-    out_a = 0          # sum_m O_m                       (qo marginals / step)
+    a_vol = 0  # sum_m O_m * prod S over A-deps  (A read volume / step)
+    out_a = 0  # sum_m O_m                       (qo marginals / step)
     for m, deps in enumerate(A_dependencies):
         O_m = int(np.shape(A[m])[0])
         out_a += O_m
@@ -193,7 +221,7 @@ def neg_efe_ffi_beneficial(
             vol *= S[d]
         a_vol += vol
 
-    b_vol = 0          # sum_f S_f * prod S over B-deps  (B read volume / step)
+    b_vol = 0  # sum_f S_f * prod S over B-deps  (B read volume / step)
     for f, deps in enumerate(B_dependencies):
         vol = S[f]
         for d in deps:
@@ -303,10 +331,16 @@ def can_handle(
     # CPU FFI targets are registered with platform="cpu" and are invisible to
     # the CUDA JIT.  On a CUDA-backend host, only allow dispatch when the CUDA
     # kernel path is actually selected; otherwise JAX handles the call.
-    if has_jax_cuda_backend() and not _use_cuda_target(
-        B_dependencies, ffi_beneficial=ffi_beneficial
-    ):
-        return False
+    if has_jax_cuda_backend():
+        cuda_selected = _use_cuda_target(
+            B_dependencies, ffi_beneficial=ffi_beneficial
+        )
+        if not cuda_selected:
+            return False
+        # The CUDA modality kernel only covers rank<=3; rank>=4 A-deps must fall
+        # back to JAX rather than dispatch into a missing kernel (hard error).
+        if any(len(deps) > CUDA_MODALITY_MAX_RANK for deps in A_dependencies):
+            return False
     if num_modalities is not None and len(A_dependencies) != num_modalities:
         return False
     if num_factors is not None and len(B_dependencies) != num_factors:
@@ -369,7 +403,9 @@ def _validate_efe_inputs(
             raise ValueError("use_param_info_gain=True requires at least one of pA, pB")
         if pA is not None and len(pA) > 0:
             if len(pA) != M:
-                raise ValueError(f"pA must have one entry per modality (M={M}); got {len(pA)}")
+                raise ValueError(
+                    f"pA must have one entry per modality (M={M}); got {len(pA)}"
+                )
             for m, (pa_m, a_m) in enumerate(zip(pA, A)):
                 if np.shape(pa_m) != np.shape(a_m):
                     raise ValueError(
@@ -378,7 +414,9 @@ def _validate_efe_inputs(
                     )
         if pB is not None and len(pB) > 0:
             if len(pB) != F:
-                raise ValueError(f"pB must have one entry per factor (F={F}); got {len(pB)}")
+                raise ValueError(
+                    f"pB must have one entry per factor (F={F}); got {len(pB)}"
+                )
             for f, (pb_f, b_f) in enumerate(zip(pB, B)):
                 if np.shape(pb_f) != np.shape(b_f):
                     raise ValueError(
@@ -396,7 +434,9 @@ def _validate_efe_inputs(
         raise ValueError(f"policy_matrix must have shape (P, T, F); got {pm_shape}")
     P, T, F_policy = pm_shape
     if P <= 0 or T <= 0 or F_policy != F:
-        raise ValueError(f"policy_matrix shape {pm_shape} is inconsistent with {F} factors")
+        raise ValueError(
+            f"policy_matrix shape {pm_shape} is inconsistent with {F} factors"
+        )
 
     qs_shapes = [np.shape(q) for q in qs_init]
     S = [int(s[0]) for s in qs_shapes]
@@ -419,10 +459,14 @@ def _validate_efe_inputs(
         O_m = A_shapes[m][0]
         if len(shape) == 1:
             if shape[0] != O_m:
-                raise ValueError(f"C[{m}] must have shape (O_m,) or (T, O_m); got {shape}")
+                raise ValueError(
+                    f"C[{m}] must have shape (O_m,) or (T, O_m); got {shape}"
+                )
         elif len(shape) == 2:
             if shape[0] != T or shape[1] != O_m:
-                raise ValueError(f"C[{m}] must have shape (O_m,) or (T, O_m); got {shape}")
+                raise ValueError(
+                    f"C[{m}] must have shape (O_m,) or (T, O_m); got {shape}"
+                )
         else:
             raise ValueError(f"C[{m}] must have shape (O_m,) or (T, O_m); got {shape}")
     for f, i_f in enumerate(I):
@@ -439,26 +483,31 @@ def _validate_efe_inputs(
         except TypeError:
             return
         if eps <= 0.0:
-            raise ValueError("inductive_epsilon must be positive when use_inductive=True")
+            raise ValueError(
+                "inductive_epsilon must be positive when use_inductive=True"
+            )
 
 
 def neg_efe_all_policies_ffi(
-    policy_matrix: jax.Array,        # [P, T, F], int32
-    qs_init: Sequence[jax.Array],    # list of F, each shape (S_f,)
-    A: Sequence[jax.Array],          # list of M, each shape (O_m, S_{dep0}, ...)
-    B: Sequence[jax.Array],          # list of F, each shape (S_f, S_{B_dep0}, ..., U_f)
-    C: Sequence[jax.Array],          # list of M, each shape (O_m,) or (T, O_m)
-    I: Sequence[jax.Array],          # list of F, each shape (depth_f, S_f)
+    policy_matrix: jax.Array,  # [P, T, F], int32
+    qs_init: Sequence[jax.Array],  # list of F, each shape (S_f,)
+    A: Sequence[jax.Array],  # list of M, each shape (O_m, S_{dep0}, ...)
+    B: Sequence[jax.Array],  # list of F, each shape (S_f, S_{B_dep0}, ..., U_f)
+    C: Sequence[jax.Array],  # list of M, each shape (O_m,) or (T, O_m)
+    I: Sequence[jax.Array],  # list of F, each shape (depth_f, S_f)
     A_dependencies: Sequence[Sequence[int]],
     B_dependencies: Sequence[Sequence[int]],
     *,
-    pA: Sequence[jax.Array] | None = None,  # list of M, same shape as A; required when use_param_info_gain
-    pB: Sequence[jax.Array] | None = None,  # list of F, same shape as B; required when use_param_info_gain
+    pA: Sequence[jax.Array]
+    | None = None,  # list of M, same shape as A; required when use_param_info_gain
+    pB: Sequence[jax.Array]
+    | None = None,  # list of F, same shape as B; required when use_param_info_gain
     use_utility: bool = True,
     use_states_info_gain: bool = True,
     use_param_info_gain: bool = False,
     use_inductive: bool = True,
     inductive_epsilon: float = 1e-3,
+    ffi_cache_params_static: bool = False,
 ) -> jax.Array:
     """Fused neg-EFE kernel — production path for `update_posterior_policies_inductive`.
 
@@ -575,6 +624,14 @@ def neg_efe_all_policies_ffi(
         flags |= FLAG_USE_INDUCTIVE
     if use_param_info_gain:
         flags |= FLAG_USE_PARAM_INFO_GAIN
+    # Warm-check hint for the CUDA-Dev path (no effect on CPU/host): set → params
+    # static across calls → devptr fast warm check; clear (default) → rebuild the
+    # caches from the device buffers every call (always correct, the learning regime).
+    # The FLAG_MODEL_PARAMS_STATIC bit name mirrors the C++ ABI (kFlagModelParamsStatic);
+    # the Python-facing knob is `ffi_cache_params_static`. See
+    # docs/ffi_cpu_cache_static_hint_rejected.md for why this is CUDA-only.
+    if ffi_cache_params_static:
+        flags |= FLAG_MODEL_PARAMS_STATIC
 
     P = policy_matrix.shape[0]
     out_type = jax.ShapeDtypeStruct((P,), jnp.float32)
@@ -591,11 +648,19 @@ def neg_efe_all_policies_ffi(
 
     pm_i32 = policy_matrix.astype(jnp.int32)
     static_attrs = dict(
-        S=S, O=O, U=U,
-        qs_offsets=qs_offsets, A_offsets=A_offsets, B_offsets=B_offsets,
-        C_offsets=C_offsets, I_offsets=I_offsets, I_depths=I_depths,
-        A_dep_flat=A_dep_flat, A_dep_offsets=A_dep_offsets,
-        B_dep_flat=B_dep_flat, B_dep_offsets=B_dep_offsets,
+        S=S,
+        O=O,
+        U=U,
+        qs_offsets=qs_offsets,
+        A_offsets=A_offsets,
+        B_offsets=B_offsets,
+        C_offsets=C_offsets,
+        I_offsets=I_offsets,
+        I_depths=I_depths,
+        A_dep_flat=A_dep_flat,
+        A_dep_offsets=A_dep_offsets,
+        B_dep_flat=B_dep_flat,
+        B_dep_offsets=B_dep_offsets,
         flags=np.int32(flags),
     )
 
@@ -618,13 +683,30 @@ def neg_efe_all_policies_ffi(
             return cuda_call_dev(pm, qs, A, B, C, I, pA, pB, eps, **static_attrs)
 
         return jax.lax.platform_dependent(
-            pm_i32, qs_flat, A_flat, B_flat, C_flat, I_flat, pA_flat, pB_flat, eps_buf,
-            cpu=_cpu_branch, cuda=_cuda_branch,
+            pm_i32,
+            qs_flat,
+            A_flat,
+            B_flat,
+            C_flat,
+            I_flat,
+            pA_flat,
+            pB_flat,
+            eps_buf,
+            cpu=_cpu_branch,
+            cuda=_cuda_branch,
         )
 
     call = _make_call(target_name)
     return call(
-        pm_i32, qs_flat, A_flat, B_flat, C_flat, I_flat, pA_flat, pB_flat, eps_buf,
+        pm_i32,
+        qs_flat,
+        A_flat,
+        B_flat,
+        C_flat,
+        I_flat,
+        pA_flat,
+        pB_flat,
+        eps_buf,
         **static_attrs,
     )
 
@@ -634,6 +716,7 @@ __all__ = [
     "FLAG_USE_STATES_INFO_GAIN",
     "FLAG_USE_INDUCTIVE",
     "FLAG_USE_PARAM_INFO_GAIN",
+    "FLAG_MODEL_PARAMS_STATIC",
     "can_handle",
     "neg_efe_all_policies_ffi",
 ]

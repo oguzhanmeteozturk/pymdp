@@ -31,10 +31,10 @@ FfiError NegEfeCpu(FfiS32Buf policy_matrix, FfiF32Buf qs_init, FfiF32Buf A, FfiF
   // vmap_method="broadcast_all" prepends a leading batch dim to every buffer.
   // Detect it from policy_matrix rank and iterate per instance inside one FFI
   // dispatch; A/B cache entries are shared across broadcast batch elements.
-  const LayoutSpans spans{S_span,         O_span,          U_span,        qs_off_span,   A_off_span,
-                          B_off_span,     C_off_span,      I_off_span,    I_depths_span, A_dep_flat_span,
-                          A_dep_off_span, B_dep_flat_span, B_dep_off_span};
-  ParsedCall        pc;
+  const LayoutSpans spans =
+      make_layout_spans(S_span, O_span, U_span, qs_off_span, A_off_span, B_off_span, C_off_span, I_off_span,
+                        I_depths_span, A_dep_flat_span, A_dep_off_span, B_dep_flat_span, B_dep_off_span);
+  ParsedCall pc;
   PYMDP_TRY(
       parse_and_validate_call(policy_matrix, qs_init, A, B, C, I, pA, pB, inductive_epsilon, out, spans, flags, &pc));
 

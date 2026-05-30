@@ -37,6 +37,8 @@ struct FactorHistoryTables {
   size_t modality_tmp_qo_max_floats = 0;
   size_t split_tmp_lin_max_floats   = 0;
   size_t q01_outer_max_floats       = 0;
+  size_t stacked_lin_in_max_floats  = 0;
+  size_t stacked_lin_out_max_floats = 0;
 };
 
 inline int max_factor_history_count(const FactorHistoryLevels& histories) {
@@ -76,6 +78,8 @@ inline void reset_factor_history_tables(const Layout& L, FactorHistoryTables* ta
   tables->modality_tmp_qo_max_floats = 0;
   tables->split_tmp_lin_max_floats   = 0;
   tables->q01_outer_max_floats       = 0;
+  tables->stacked_lin_in_max_floats  = 0;
+  tables->stacked_lin_out_max_floats = 0;
 }
 
 // Shared factor-side fill: factor_score_offsets prefix sum + memcpy each
@@ -140,6 +144,16 @@ inline void build_factor_history_tables(const Layout& L, const FactorHistoryLeve
         if (deps.rank == 2) {
           tables->modality_tmp_qo_max_floats =
               std::max(tables->modality_tmp_qo_max_floats, static_cast<size_t>(Bn) * Om * H0 * H1);
+          // tmp_lin[Bn, H_kk] for the per-modality rank-2 linear-term GEMM.
+          tables->split_tmp_lin_max_floats =
+              std::max(tables->split_tmp_lin_max_floats, static_cast<size_t>(Bn) * H0 * H1);
+          // Dependency-group batched linear term: a group has at most L.M
+          // members, all sharing this (K_d, H_kk). Bn*M*K_d / Bn*M*H_kk bound
+          // the stacked GEMM operand / output across any single group.
+          tables->stacked_lin_in_max_floats =
+              std::max(tables->stacked_lin_in_max_floats, static_cast<size_t>(Bn) * L.M * S0 * S1);
+          tables->stacked_lin_out_max_floats =
+              std::max(tables->stacked_lin_out_max_floats, static_cast<size_t>(Bn) * L.M * H0 * H1);
         } else {
           const int S_split = dep_state_size(L, deps, 2);
           tables->modality_tmp_qo_max_floats =

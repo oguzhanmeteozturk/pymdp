@@ -877,6 +877,7 @@ class Agent(Module):
         """
 
         latest_belief = jtu.tree_map(lambda x: x[:, -1], qs) # only get the posterior belief held at the current timepoint
+        ffi_cache_params_static = not (self.learn_A or self.learn_B)
         infer_policies = partial(
             control.update_posterior_policies_inductive,
             self.policies.policy_arr,
@@ -885,7 +886,8 @@ class Agent(Module):
             use_utility=self.use_utility,
             use_states_info_gain=self.use_states_info_gain,
             use_param_info_gain=self.use_param_info_gain,
-            use_inductive=self.use_inductive
+            use_inductive=self.use_inductive,
+            ffi_cache_params_static=ffi_cache_params_static,
         )
 
         q_pi, neg_efe = vmap(infer_policies)(

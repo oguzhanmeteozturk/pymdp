@@ -86,6 +86,7 @@ from ._core import (
     with_jax_grad,
 )
 from ._efe import (
+    FLAG_MODEL_PARAMS_STATIC,
     FLAG_USE_INDUCTIVE,
     FLAG_USE_PARAM_INFO_GAIN,
     FLAG_USE_STATES_INFO_GAIN,
@@ -134,7 +135,9 @@ def _eager_register(fn, name: str) -> None:
         # whole point — eager-only is the root-cause fix; falling through
         # to lazy registration reintroduces the rehash mid-trace hazard.
         if os.environ.get("PYMDP_FFI_QUIET_EAGER_REGISTER") != "1":
-            sys.stderr.write(f"pymdp.ffi: eager register {name} failed: {type(exc).__name__}: {exc}\n")
+            sys.stderr.write(
+                f"pymdp.ffi: eager register {name} failed: {type(exc).__name__}: {exc}\n"
+            )
 
 
 _eager_register(_register_all_efe_targets_eager, "neg-efe")
@@ -146,6 +149,7 @@ __all__ = [
     "FLAG_USE_STATES_INFO_GAIN",
     "FLAG_USE_INDUCTIVE",
     "FLAG_USE_PARAM_INFO_GAIN",
+    "FLAG_MODEL_PARAMS_STATIC",
     "can_handle",
     "can_handle_fpi",
     "cpu_capabilities",

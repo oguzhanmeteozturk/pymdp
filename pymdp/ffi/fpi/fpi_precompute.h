@@ -2,8 +2,7 @@
 //
 // ModalityDispatch is kept distinct from neg_efe's `ModalityMeta` because
 // their fields are tightly bound to per-kernel precompute pipelines that
-// don't overlap. The `FpiModalityMeta` typedef provides a seam that future
-// struct unification can land against without touching call sites.
+// don't overlap.
 
 #pragma once
 
@@ -17,7 +16,6 @@
 
 #include "common/error_helpers.h"
 #include "common/modality_dispatch.h"
-#include "common/scratch_arena.h"
 #include "fpi/fpi_entry.h"
 
 namespace pymdp_ffi {
@@ -56,10 +54,6 @@ struct ModalityDispatch {
   std::array<int64_t, kMaxFfiDependencyRank> f_offs;
 };
 
-// Seam for future unification with neg_efe's ModalityMeta; the two structs
-// share (K, Ss, lp_offs) but FPI adds K>=4 F-chain offsets.
-using FpiModalityMeta = ModalityDispatch;
-
 // Build the per-modality dispatch table. Validates each modality's dep rank
 // and factor refs, populates the K hot-path fields (Ss, lp_offs, ll_off), and
 // for K>=4 precomputes the (tail, suf_offs, f_offs) triples used by
@@ -85,16 +79,7 @@ inline FfiError build_modality_dispatch(FfiInt64Span S, FfiInt64Span ll_offsets,
     PYMDP_TRY(validate_dep_rank_and_factors(kFpiKernelName, mod_label.c_str(), F, K, A_dep_flat.begin() + dep_start));
     for (int64_t i = 0; i < K; ++i) {
       const int64_t d = A_dep_flat[dep_start + i];
-      // Distinct factors per modality: the hot-loop kernels mark q[deps[i]] /
-      // log_q[deps[i]] slices __restrict__, so aliasing would be silent UB.
-      // Python's can_handle_fpi rejects duplicates up front; this is the C++
-      // re-check at the ABI boundary.
-      for (int64_t j = 0; j < i; ++j) {
-        if (md.lp_offs[j] == lp_offsets[d]) {
-          return invalid_arg(kFpiKernelName,
-                             "modality " + std::to_string(m) + " has duplicate factor in A_dependencies");
-        }
-      }
+      PYMDP_TRY(check_distinct_modality_factor(m, md.lp_offs.data(), i, static_cast<int32_t>(lp_offsets[d])));
       md.Ss[i]      = static_cast<int32_t>(S[d]);
       md.lp_offs[i] = static_cast<int32_t>(lp_offsets[d]);
     }
@@ -113,7 +98,7 @@ inline FfiError build_modality_dispatch(FfiInt64Span S, FfiInt64Span ll_offsets,
         md.suf_offs[k] = md.suf_offs[k + 1] + md.tail[k + 1];
       }
       md.f_offs[0] = 0;
-      if (K >= 2) md.f_offs[1] = 0;
+      md.f_offs[1] = 0;  // K>=4 here, so f_offs[1] always exists (F_1 aliases ll)
       for (int k = 2; k < K; ++k) {
         md.f_offs[k] = md.f_offs[k - 1] + md.Ss[k - 1] * md.tail[k - 1];
       }

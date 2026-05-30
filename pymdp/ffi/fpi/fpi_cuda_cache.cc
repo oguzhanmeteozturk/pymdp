@@ -18,6 +18,7 @@
 #include "xla/ffi/api/ffi.h"
 
 #include "common/error_helpers.h"
+#include "common/modality_dispatch.h"
 #include "fpi/fpi_cuda_cache.h"
 #include "fpi/fpi_cuda_context.h"
 #include "fpi/fpi_cuda_kernels.h"
@@ -87,10 +88,7 @@ FfiError refresh_fpi_cuda_cache(FfiInt64Span S_span, FfiInt64Span ll_offsets, Ff
       F <= static_cast<int64_t>(fpi_cuda::kMaxFSmallMeta) && M <= static_cast<int64_t>(fpi_cuda::kMaxMSmallMeta);
 
   if (!host_cache_hit) {
-    // Build per-modality dispatch on host. Validate K range — if any
-    // modality has K >= 4 the gate in _fpi.py screwed up; fail loudly
-    // rather than produce silent garbage from the kernel's no-op default
-    // arm.
+    // Build per-modality dispatch on host (validation inline in the loop below).
     std::vector<int32_t>                       S_host(F);
     std::vector<int32_t>                       lp_offsets_host(F);
     std::vector<fpi_cuda::ModalityDispatchGpu> mods_host(M);
@@ -101,31 +99,22 @@ FfiError refresh_fpi_cuda_cache(FfiInt64Span S_span, FfiInt64Span ll_offsets, Ff
     for (int64_t m = 0; m < M; ++m) {
       const int64_t dep_start = A_dep_offsets[m];
       const int64_t K         = A_dep_offsets[m + 1] - dep_start;
-      if (K < 1 || K > fpi_cuda::kRankMax) {
-        return invalid_arg(kFpiKernelName, "FpiCudaDevice handles modality K in [1, " +
-                                               std::to_string(fpi_cuda::kRankMax) + "]; modality " +
-                                               std::to_string(m) + " has K = " + std::to_string(K));
-      }
+      // K-range + factor-range checks shared with the CPU build path
+      // (build_modality_dispatch). kRankMax caps K below the generic [1,8]
+      // ABI bound — modality K>=4 routes to the FpiCudaHost shim, so reaching
+      // here with K>=4 means the _fpi.py gate screwed up; fail loudly rather
+      // than feed the kernel's no-op default arm.
+      const std::string mod_label = "modality " + std::to_string(m) + " A_dep";
+      PYMDP_TRY(validate_dep_rank_and_factors(kFpiKernelName, mod_label.c_str(), F, K, A_dep_flat.begin() + dep_start,
+                                              fpi_cuda::kRankMax));
       fpi_cuda::ModalityDispatchGpu& md = mods_host[m];
       md.K                              = static_cast<int32_t>(K);
       md.ll_off                         = static_cast<int32_t>(ll_offsets[m]);
       for (int64_t i = 0; i < K; ++i) {
         const int64_t d = A_dep_flat[dep_start + i];
-        if (d < 0 || d >= F) {
-          return invalid_arg(kFpiKernelName, "modality " + std::to_string(m) + " references out-of-range factor");
-        }
-        md.Ss[i]      = S_host[d];
-        md.lp_offs[i] = lp_offsets_host[d];
-        // Duplicate factor within a modality aliases two log_q slices onto
-        // the same offset, silently corrupting the update. can_handle_fpi
-        // rejects this up front; this is the C++ safety net (mirrors
-        // build_modality_dispatch).
-        for (int64_t j = 0; j < i; ++j) {
-          if (md.lp_offs[j] == md.lp_offs[i]) {
-            return invalid_arg(kFpiKernelName,
-                               "modality " + std::to_string(m) + " has duplicate factor in A_dependencies");
-          }
-        }
+        md.Ss[i]        = S_host[d];
+        md.lp_offs[i]   = lp_offsets_host[d];
+        PYMDP_TRY(check_distinct_modality_factor(m, md.lp_offs, i, md.lp_offs[i]));
       }
       for (int64_t i = K; i < fpi_cuda::kRankMax; ++i) {
         md.Ss[i]      = 0;
@@ -200,10 +189,9 @@ FfiError refresh_fpi_cuda_cache(FfiInt64Span S_span, FfiInt64Span ll_offsets, Ff
       CUDA_TRY("fpi_cuda H2D lp_offsets",
                cudaMemcpyAsync(cs.lp_offsets_dev.ptr, lp_offsets_host.data(),
                                static_cast<std::size_t>(F) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-      CUDA_TRY("fpi_cuda H2D mods",
-               cudaMemcpyAsync(cs.mods_dev.ptr, mods_host.data(),
-                               static_cast<std::size_t>(M) * sizeof(fpi_cuda::ModalityDispatchGpu),
-                               cudaMemcpyHostToDevice, stream));
+      CUDA_TRY("fpi_cuda H2D mods", cudaMemcpyAsync(cs.mods_dev.ptr, mods_host.data(),
+                                                    static_cast<std::size_t>(M) * sizeof(fpi_cuda::ModalityDispatchGpu),
+                                                    cudaMemcpyHostToDevice, stream));
     }
     cs.sig = sig;
   }

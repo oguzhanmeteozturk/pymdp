@@ -87,7 +87,9 @@ def dep_indices_in_range(deps: Sequence[int], num_factors: int) -> bool:
     return all(0 <= d < num_factors for d in deps)
 
 
-def _register(target_name: str, symbol_name: str | None = None, platform: str = "cpu") -> None:
+def _register(
+    target_name: str, symbol_name: str | None = None, platform: str = "cpu"
+) -> None:
     # Register key is (target_name, platform) so a target available on both
     # CPU and CUDA can be registered twice with different symbols pointing
     # at distinct C entry points.
@@ -134,6 +136,25 @@ def has_jax_cuda_backend() -> bool:
         # jax.devices() can raise when no backend is available for the
         # default platform. Treat as "no CUDA backend".
         return False
+
+
+def cuda_platform_allowed_by_env() -> bool:
+    """True unless ``JAX_PLATFORMS`` explicitly excludes CUDA.
+
+    Cheap, no jax.devices() call (which would force backend init and trip the
+    eager-registration ordering hazard documented on
+    ``_register_all_efe_targets_eager``). When JAX_PLATFORMS is set, JAX skips
+    initializing platforms not listed there — registering FFI handlers at
+    ``platform="CUDA"`` against a missing CUDA platform leaves orphaned entries
+    that subsequent CPU backend init validates and rejects with
+    "Types used by FFI handlers must be registered before the handler
+    registration". Use this to skip CUDA-platform registrations whenever the
+    env makes CUDA backend init impossible.
+    """
+    platforms = os.environ.get("JAX_PLATFORMS", "").strip().lower()
+    if not platforms:
+        return True
+    return any(p.strip() in ("cuda", "gpu") for p in platforms.split(","))
 
 
 def _register_multistage(
@@ -237,7 +258,9 @@ def flatten_ragged_f32(
         a = jnp.asarray(arr, dtype=jnp.float32).reshape(-1)
         flat_chunks.append(a)
         offsets[i + 1] = offsets[i] + a.size
-    flat = jnp.concatenate(flat_chunks) if flat_chunks else jnp.zeros(0, dtype=jnp.float32)
+    flat = (
+        jnp.concatenate(flat_chunks) if flat_chunks else jnp.zeros(0, dtype=jnp.float32)
+    )
     return flat, offsets
 
 
@@ -298,6 +321,7 @@ __all__ = [
     "flatten_dep_lists",
     "flatten_ragged_f32",
     "has_jax_cuda_backend",
+    "cuda_platform_allowed_by_env",
     "is_available",
     "load_error",
     "with_jax_grad",

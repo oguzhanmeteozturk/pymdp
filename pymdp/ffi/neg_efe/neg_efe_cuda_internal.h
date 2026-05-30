@@ -85,6 +85,13 @@ inline uint64_t cuda_linear_sig(const Layout& L, int Bn) {
   return fnv1a64_mix(a_sig_bn(L, Bn), static_cast<uint64_t>(L.T));
 }
 
+// The two flags that shape the `linear` tensor, packed into the linear_cache
+// key bits. The warm-check in entry.cc and the cold fill in cache.cc must use
+// the identical packing or a warm call reads against a stale-flagged cache.
+inline int32_t linear_flag_bits(KernelFlags flags) {
+  return (flags.use_states_info_gain ? 1 : 0) | (flags.use_utility ? 2 : 0);
+}
+
 // =============================================================================
 // Cross-TU function declarations
 // =============================================================================
@@ -96,6 +103,26 @@ inline uint64_t cuda_linear_sig(const Layout& L, int Bn) {
 FfiError prepare_caches(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const int32_t* pm_base,
                         const float* A_base, const float* B_base, const float* C_base, const float* pA_base,
                         const float* pB_base, bool pA_present, bool pB_present);
+
+// Learning fast path: rebuild the A / B / linear caches directly from the
+// device-resident A / B / C buffers (no D2H + host pack + implicit H2D),
+// stream-ordered. Tree cache is the caller's responsibility (it is keyed on the
+// never-mutated policy_matrix, so it is reused across learning steps by devptr
+// and never rebuilt here). `repack_tag` is a per-call monotonic sentinel used
+// as the cache content_tag — it makes every learning rebuild key-distinct so a
+// later warm check (any path) misses and rebuilds rather than risking a stale
+// hit. When use_param_info_gain is set, pA_dev / pB_dev (nullable) drive the
+// on-device wA / wB wnorm repack; pass nullptr for an absent buffer or when the
+// flag is off (the wA / wB caches are then cleared).
+FfiError prepare_caches_device(NegEfeContext& ctx, const Layout& L, KernelFlags flags, int Bn, const float* A_dev,
+                               const float* B_dev, const float* C_dev, const float* pA_dev, const float* pB_dev,
+                               uint64_t repack_tag, cudaStream_t stream);
+
+// Build (or reuse on a content-tag hit) just the tree cache from a host policy
+// matrix. The device-repack path uses this to (re)build the tree on the first
+// learning call; subsequent steps reuse it by policy_matrix devptr without a
+// D2H. Thin wrapper over the same fill the general prepare_caches drives.
+FfiError prepare_tree_cache(NegEfeContext& ctx, const Layout& L, int Bn, const int32_t* pm_base);
 
 // runtime.cc — scratch sizing, qs / inductive upload, full forward pass driver,
 // optional timing log.

@@ -6,9 +6,7 @@
 // (neg_efe_precompute.h) structs stay where they are. Unifying them would
 // require forcing fields from both kernels' precompute pipelines (FPI's
 // K>=4 F-chain offsets vs neg-EFE's PrecomputedHA / TransposedB offsets)
-// into a single struct, adding more code than it removes. fpi/fpi_precompute.h
-// carries a typedef seam (`using FpiModalityMeta = ModalityDispatch`) so a
-// future unification can land without touching call sites.
+// into a single struct, adding more code than it removes.
 
 #pragma once
 

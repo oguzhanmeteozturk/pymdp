@@ -20,10 +20,26 @@
 namespace pymdp_ffi {
 
 // Bit positions must match pymdp/ffi/_efe.py FLAG_USE_* (exported from pymdp.ffi).
-constexpr int32_t     kFlagUseUtility        = 1 << 0;
-constexpr int32_t     kFlagUseStatesInfoGain = 1 << 1;
-constexpr int32_t     kFlagUseInductive      = 1 << 2;
-constexpr int32_t     kFlagUseParamInfoGain  = 1 << 3;
+constexpr int32_t kFlagUseUtility        = 1 << 0;
+constexpr int32_t kFlagUseStatesInfoGain = 1 << 1;
+constexpr int32_t kFlagUseInductive      = 1 << 2;
+constexpr int32_t kFlagUseParamInfoGain  = 1 << 3;
+// Caller guarantees the model params (A, B, C, pA, pB, policy_matrix) are not
+// mutated in place across calls of this executable — i.e. no learning step
+// rewrites the donated A/B buffers between calls (Agent.learn_{A,B} both off).
+// When set, the CUDA-Dev warm check (caches_are_warm) may trust devptr+size+sig
+// identity and skip the per-call content-fingerprint gather + stream sync; the
+// only failure mode of devptr identity is in-place mutation, which this rules
+// out. Cleared (default) keeps the content fingerprint, which is correct
+// regardless of mutation. No effect on the CPU / CUDA-host paths (they key on a
+// cheap host-side content tag with no sync).
+// Set: params static across calls → CUDA-Dev warm-checks by devptr identity and
+// reuses the resident caches. Clear (default): no such guarantee → the CUDA-Dev
+// cold path rebuilds the A/B/linear caches from the device buffers every call
+// (always correct, never stale — also the online-learning regime). The device
+// repack additionally requires use_param_info_gain off; otherwise the host cold
+// path rebuilds (incl. wA/wB). No effect on the CPU / CUDA-host paths.
+constexpr int32_t     kFlagModelParamsStatic = 1 << 4;
 constexpr const char* kEfeKernelName         = "efe_ffi";
 
 // Host-owned payloads matching FFI int layouts (offsets, CSR-style headers).
@@ -37,13 +53,12 @@ struct KernelFlags {
   bool use_states_info_gain;
   bool use_inductive;
   bool use_param_info_gain;
+  bool model_params_static;
 
   static constexpr KernelFlags from_bits(int32_t bits) {
     return {
-        (bits & kFlagUseUtility) != 0,
-        (bits & kFlagUseStatesInfoGain) != 0,
-        (bits & kFlagUseInductive) != 0,
-        (bits & kFlagUseParamInfoGain) != 0,
+        (bits & kFlagUseUtility) != 0,       (bits & kFlagUseStatesInfoGain) != 0, (bits & kFlagUseInductive) != 0,
+        (bits & kFlagUseParamInfoGain) != 0, (bits & kFlagModelParamsStatic) != 0,
     };
   }
 };
@@ -118,6 +133,19 @@ struct LayoutSpans {
   FfiInt64Span B_dep_flat;
   FfiInt64Span B_dep_off;
 };
+
+// Bundle the 13 raw attribute spans into a LayoutSpans in the one canonical
+// field order. Centralizing the aggregate here means the three FFI entry
+// handlers (CPU + the two CUDA targets) build `spans` with a single call
+// instead of repeating the 13-field positional literal, and the field order
+// lives in exactly one place if the Bind chain ever changes.
+inline LayoutSpans make_layout_spans(FfiInt64Span S, FfiInt64Span O, FfiInt64Span U, FfiInt64Span qs_off,
+                                     FfiInt64Span A_off, FfiInt64Span B_off, FfiInt64Span C_off, FfiInt64Span I_off,
+                                     FfiInt64Span I_depths, FfiInt64Span A_dep_flat, FfiInt64Span A_dep_off,
+                                     FfiInt64Span B_dep_flat, FfiInt64Span B_dep_off) {
+  return LayoutSpans{S,     O,        U,          qs_off,    A_off,      B_off,    C_off,
+                     I_off, I_depths, A_dep_flat, A_dep_off, B_dep_flat, B_dep_off};
+}
 
 inline int a_dep_rank(const Layout& L, int64_t m) {
   return static_cast<int>(L.A_dep_off[m + 1] - L.A_dep_off[m]);

@@ -10,6 +10,7 @@ import numpy as np
 
 from ._core import (
     _register,
+    cuda_platform_allowed_by_env,
     dep_indices_in_range,
     dep_list_rank_ok,
     flatten_dep_lists,
@@ -34,7 +35,7 @@ def can_handle_fpi(
     K=1/K=2/K=3 use specialized hot paths in the kernel; K>=4 dispatches to
     a generic forward-chain path (modality_Kn) — same auto-vectorized inner
     primitives, runtime K. Upper bound is kMaxFfiDependencyRank in
-    pymdp/ffi/src/neg_efe_layout.h (= MAX_FFI_DEP_RANK in _core.py).
+    pymdp/ffi/src/common/modality_dispatch.h (= MAX_FFI_DEP_RANK in _core.py).
     """
     if not is_available():
         return False
@@ -71,7 +72,7 @@ def _native_cuda_fpi_eligible(A_dependencies: Sequence[Sequence[int]]) -> bool:
     modality marginals — K>=4 dispatches the kernel's switch default which
     silently produces no work. The host gate filters those cases here so the
     K>=4 path routes through the pymdp_fpi_cuda_host shim instead. Every
-    production rollout fixture (rollout_loop / rollout_realistic /
+    production rollout fixture (rollout_loop / rollout_inductive_batched /
     rollout_learning) lands in K<=3 so this gate fires for the cases that
     matter most. fpi_high_rank (K=5) takes the shim.
 
@@ -285,7 +286,13 @@ def _register_all_fpi_targets_eager() -> None:
     # platforms unconditionally. has_jax_cuda_backend() forces backend init,
     # which trips an FFI ordering precondition on Tegra during eager mode;
     # the CUDA entry is a harmless no-op when no CUDA backend is present.
+    # Exception: when JAX_PLATFORMS explicitly omits cuda/gpu, JAX never
+    # initializes the CUDA platform — handlers registered against it become
+    # orphaned entries and the subsequent CPU init rejects the whole table.
+    # See cuda_platform_allowed_by_env() for the full chain.
     _register("pymdp_fpi", platform="cpu")
+    if not cuda_platform_allowed_by_env():
+        return
     _register("pymdp_fpi_cuda_host", platform="CUDA")
     _register("pymdp_fpi_cuda_native", platform="CUDA")
 

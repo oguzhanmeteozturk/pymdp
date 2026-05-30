@@ -176,6 +176,17 @@ struct NodeScratch {
   std::vector<float> wa_qs;
   std::vector<float> wb_qs;
 
+  // Shared-contraction scratch for the rank>=2 modality fast path
+  // (score_modality_shared). `mod_T_shared` holds the per-inner-history partial
+  // contraction T[h][(O + has_HA) rows][Krem] (Krem = K / S_inner);
+  // `mod_qin_compact` is the f16-packed inner-factor marginal consumed by the
+  // f16/FML stage-1 sgemv; `mod_qrem_f32` holds the Kronecker product of the
+  // outer (first R-1) factors built per combination in stage 2. Sized on demand
+  // inside the routine (resize-up-only).
+  std::vector<float>  mod_T_shared;
+  std::vector<FfiF16> mod_qin_compact;
+  std::vector<float>  mod_qrem_f32;
+
   // Resize-up-only: pymdp call patterns repeat shapes across calls; retaining
   // capacity hits zero allocations in steady state.
   void ensure_size(int64_t max_O, int64_t max_K, int64_t max_inner_K, int64_t max_K_b, int64_t max_S) {
@@ -361,6 +372,42 @@ struct Kernel {
     return delta;
   }
 
+  // Decide whether to fire OMP for one tree level. Two gates that both have to
+  // pass:
+  //   * level_flops >= kNegEfeLevelOmpFlopThreshold — total work has to
+  //     amortize the libomp fork+barrier (~50K FMAs at M3 Max NEON
+  //     throughput ÷ 12 perf cores). Without this, agent_step's tiny
+  //     [8,6,4] state shape (~40K FMAs/level) burns more on fork than
+  //     it saves.
+  //   * max_subloop_iter >= kOmpNodeThreshold — the largest single
+  //     `omp for` inside the parallel region has to distribute usefully
+  //     across the team. rollout_loop hits this case: level_flops is
+  //     ~1.6M but every sub-loop has ~12 items (P=12 with factor-local
+  //     layout), so a 12-thread team gives 1 item/thread + barrier-wait
+  //     and net-regresses vs serial. Inductive / param_info_gain leaf
+  //     levels have 200+ entries per modality and clear this gate.
+  // Pure integer bookkeeping, runs once per level (cold relative to the
+  // per-history scoring loops); inlined at -O3.
+  bool decide_run_level_omp(int64_t t, const FactorHistoryRow& factors_level, const FactorHistoryTables& tables) const {
+    int64_t level_flops      = 0;
+    int64_t max_subloop_iter = 0;
+    for (int64_t f = 0; f < L.F; ++f) {
+      const FactorMeta& fm = metas.factors[f];
+      const int64_t     n  = factors_level[f].n_histories;
+      level_flops += n * fm.S * fm.K;
+      max_subloop_iter = std::max(max_subloop_iter, n);
+    }
+    const int64_t mod_extra_row = flags.use_states_info_gain ? 1 : 0;
+    for (int64_t m = 0; m < L.M; ++m) {
+      const ModalityMeta& mm      = metas.modalities[m];
+      const int64_t       tm      = factor_history_tm_index(t, m, L.M);
+      const int64_t       local_n = tables.mod_score_offsets[tm + 1] - tables.mod_score_offsets[tm];
+      level_flops += local_n * (mm.O + mod_extra_row) * mm.K;
+      max_subloop_iter = std::max(max_subloop_iter, local_n);
+    }
+    return level_flops >= kNegEfeLevelOmpFlopThreshold && max_subloop_iter >= kOmpNodeThreshold;
+  }
+
   // Process every history at one tree level: factor rollout (B-propagation +
   // optional pB-novelty + optional inductive) followed by modality scoring.
   // Single OMP fork per level — workers fan out across factor histories
@@ -382,36 +429,7 @@ struct Kernel {
       next->histories[f] = factors_level[f].n_histories;
     }
 
-    // Decide whether to fire OMP. Two gates that both have to pass:
-    //   * level_flops >= kNegEfeLevelOmpFlopThreshold — total work has to
-    //     amortize the libomp fork+barrier (~50K FMAs at M3 Max NEON
-    //     throughput ÷ 12 perf cores). Without this, agent_step's tiny
-    //     [8,6,4] state shape (~40K FMAs/level) burns more on fork than
-    //     it saves.
-    //   * max_subloop_iter >= kOmpNodeThreshold — the largest single
-    //     `omp for` inside the parallel region has to distribute usefully
-    //     across the team. rollout_loop hits this case: level_flops is
-    //     ~1.6M but every sub-loop has ~12 items (P=12 with factor-local
-    //     layout), so a 12-thread team gives 1 item/thread + barrier-wait
-    //     and net-regresses vs serial. Inductive / param_info_gain leaf
-    //     levels have 200+ entries per modality and clear this gate.
-    int64_t level_flops      = 0;
-    int64_t max_subloop_iter = 0;
-    for (int64_t f = 0; f < L.F; ++f) {
-      const FactorMeta& fm = metas.factors[f];
-      const int64_t     n  = factors_level[f].n_histories;
-      level_flops += n * fm.S * fm.K;
-      max_subloop_iter = std::max(max_subloop_iter, n);
-    }
-    const int64_t mod_extra_row = flags.use_states_info_gain ? 1 : 0;
-    for (int64_t m = 0; m < L.M; ++m) {
-      const ModalityMeta& mm      = metas.modalities[m];
-      const int64_t       tm      = factor_history_tm_index(t, m, L.M);
-      const int64_t       local_n = tables.mod_score_offsets[tm + 1] - tables.mod_score_offsets[tm];
-      level_flops += local_n * (mm.O + mod_extra_row) * mm.K;
-      max_subloop_iter = std::max(max_subloop_iter, local_n);
-    }
-    const bool use_omp = level_flops >= kNegEfeLevelOmpFlopThreshold && max_subloop_iter >= kOmpNodeThreshold;
+    const bool use_omp = decide_run_level_omp(t, factors_level, tables);
 
     auto run_factor_phase = [&](NodeScratch& s, bool use_omp) {
       int64_t f_score_off = 0;
@@ -455,8 +473,17 @@ struct Kernel {
             score_modality_entry(t, mm, deps, *next, tables, idx, tuple_base, strides, score_m, s);
           }
         } else {
-          for (int64_t idx = 0; idx < local_n; ++idx) {
-            score_modality_entry(t, mm, deps, *next, tables, idx, tuple_base, strides, score_m, s);
+          // Serial scoring: rank>=2 non-pA modalities take the shared-contraction
+          // fast path (build A.q_inner once per inner history, reuse across the
+          // outer factors' histories). pA novelty and rank < 2 keep the
+          // per-entry routine.
+          const bool pa_active = flags.use_param_info_gain && wA_data != nullptr;
+          if (deps.rank >= 2 && !pa_active) {
+            score_modality_shared(t, mm, *next, tables, tuple_base, strides, local_n, score_m, s);
+          } else {
+            for (int64_t idx = 0; idx < local_n; ++idx) {
+              score_modality_entry(t, mm, deps, *next, tables, idx, tuple_base, strides, score_m, s);
+            }
           }
         }
       }
@@ -539,6 +566,106 @@ struct Kernel {
           build_qs_outer_history_typed<FfiF16>(L, deps, qs_next, histories.data(), kMaxFfiDependencyRank,
                                                s.interm_f32.data(), s.interm_spare.data(), s.qs_outer_compact.data());
       score_m[idx] = score_modality(mm, t, qs_outer_compact, nullptr, s);
+    }
+  }
+
+  // Shared-contraction fast path for rank>=2 modalities (serial scoring only).
+  //
+  // The per-entry path (score_modality_entry -> score_modality) materializes the
+  // full K = prod(S_dep) Kronecker product of all dependency marginals for every
+  // history combination and contracts A against it — recomputing the
+  // A . q_inner contraction redundantly for every combination of the outer
+  // factors' histories. JAX's factor_dot / opt_einsum shares that contraction.
+  // This mirrors it with one level of sharing on the innermost dependency factor
+  // (A's contiguous axis): contract A (and the H_A row) against each distinct
+  // inner-factor history q_inner[h] once into T[h] (shape (O + has_HA) x Krem,
+  // Krem = K / S_inner), then finish each combination by contracting T[h_inner]
+  // against the Kronecker product of the remaining outer factors' marginals
+  // (Krem-sized — S_inner times smaller than the full product). Cost drops from
+  // prod(H)*O*K to H_inner*O*K + prod(H)*(O*Krem + Krem-build): the S_inner
+  // redundancy the per-entry path pays on the inner factor.
+  //
+  // For rank 2 the outer product is just q_outer[h0] (rank-1 build returns the
+  // marginal pointer, no materialization), recovering the two-factor schedule
+  // exactly. Scoped to the serial modality phase and the non-param-info-gain
+  // case: the OMP phase (deep inductive, amortized across cores) and the pA/wA
+  // novelty path keep the per-entry routine. q_outer stays f32 through stage 2
+  // (the per-entry path quantizes the product to f16), so results move toward
+  // the f32 JAX reference, not away from it.
+  void score_modality_shared(int64_t t, const ModalityMeta& mm, const QsLevel& qs_next,
+                             const FactorHistoryTables& tables, int64_t tuple_base, const int64_t* strides,
+                             int64_t local_n, float* score_m, NodeScratch& s) const {
+    const DependencyView& deps    = mm.state_deps;
+    const int             R       = deps.rank;
+    const int64_t         f_inner = deps.factors[R - 1];
+    const int64_t         S_inner = L.S[f_inner];
+    const int64_t         K       = mm.K;
+    const int64_t         Krem    = K / S_inner;  // prod(S over outer factors)
+    const int64_t         O       = mm.O;
+    const int64_t         H_inner = qs_next.histories[f_inner];
+    const bool            sig     = flags.use_states_info_gain;
+    const int64_t         rows    = O + (sig ? 1 : 0);
+
+    const float* qin_base = qs_next.ptrs[f_inner];
+
+    ensure_at_least(s.mod_T_shared, std::max<int64_t>(H_inner * rows * Krem, 1));
+    ensure_at_least(s.mod_qrem_f32, std::max<int64_t>(Krem, 1));
+    float* T = s.mod_T_shared.data();
+
+    // Stage 1: contract A (rows 0..O-1) and the H_A row (row O, when sig)
+    // against each inner-factor history. A[r] is laid out (Krem x S_inner)
+    // row-major because the inner dependency factor is A's contiguous axis.
+    for (int64_t h = 0; h < H_inner; ++h) {
+      const float* qin = qin_base + h * S_inner;
+      float*       Th  = T + h * rows * Krem;
+#if PYMDP_FFI_HAS_F16_FML
+      ensure_at_least(s.mod_qin_compact, S_inner);
+      pack_f32_to_f16(S_inner, qin, s.mod_qin_compact.data());
+      const FfiF16* Aaug = A_aug_compact + mm.offsets.A_aug;  // (O + 1) x K, f16
+      for (int64_t r = 0; r < rows; ++r) {
+        sgemv_rm_compact(Krem, S_inner, Aaug + r * K, S_inner, s.mod_qin_compact.data(), Th + r * Krem);
+      }
+#else
+      // ARMv8.0 / non-FML: contract the f32 source A directly (no A_aug), with
+      // the H_A row sourced from the separate HA precompute buffer.
+      const float* Am = A_data + mm.offsets.A_input;  // O x K, f32
+      for (int64_t o = 0; o < O; ++o) {
+        sgemv_rm_f32(Krem, S_inner, Am + o * K, S_inner, qin, Th + o * Krem);
+      }
+      if (sig) {
+        sgemv_rm_f32(Krem, S_inner, HA->data.data() + mm.offsets.entropy, S_inner, qin, Th + O * Krem);
+      }
+#endif
+    }
+
+    // Stage 2: finish each combination. q_rem = Kronecker product of the outer
+    // (first R-1) factors' marginals; qo = T[h_inner] . q_rem.
+    const DependencyView                       prefix{R - 1, deps.factors};
+    const bool                                 have_tuples = !tables.mod_history_tuples.empty();
+    std::array<int32_t, kMaxFfiDependencyRank> histories{};
+    for (int64_t idx = 0; idx < local_n; ++idx) {
+      if (have_tuples) {
+        const int32_t* tuple = tables.mod_history_tuples.data() + tuple_base + idx * kMaxFfiDependencyRank;
+        for (int i = 0; i < R; ++i) histories[i] = tuple[i];
+      } else {
+        decode_history_tuple(idx, strides, R, histories.data());
+      }
+      const int32_t h_inner = histories[R - 1];
+      const float*  q_rem   = build_qs_outer_history(L, prefix, qs_next, histories.data(), kMaxFfiDependencyRank,
+                                                     s.interm_f32.data(), s.interm_spare.data(), s.mod_qrem_f32.data());
+      const float*  Th      = T + static_cast<int64_t>(h_inner) * rows * Krem;
+      float*        qo      = s.qo_plus_HA.data();
+      sgemv_rm_f32(O, Krem, Th, Krem, q_rem, qo);
+
+      float delta = 0.0f;
+      if (sig) {
+        const float ha_dot = sdot_f32(Krem, Th + O * Krem, q_rem);
+        delta += entropy(qo, O) - ha_dot;
+      }
+      if (flags.use_utility) {
+        delta += sdot_f32(O, qo, C_data + mm.offsets.C_input + t * O);
+      }
+      score_m[idx] = delta;
     }
   }
 };

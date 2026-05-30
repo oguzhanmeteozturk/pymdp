@@ -210,6 +210,7 @@ def update_posterior_policies(
     use_utility: bool = True,
     use_states_info_gain: bool = True,
     use_param_info_gain: bool = False,
+    ffi_cache_params_static: bool = False,
 ) -> tuple[Array, Array]:
     """Compute posterior over policies and policy-wise negative expected free energy.
 
@@ -250,6 +251,11 @@ def update_posterior_policies(
         Whether to include state epistemic value.
     use_param_info_gain: bool, default=False
         Whether to include parameter epistemic value.
+    ffi_cache_params_static: bool, default=False
+        FFI-only cache hint, ignored by the JAX reference path. When `True` the
+        caller guarantees A/B are not mutated in place across calls, letting the
+        CUDA-Dev kernel warm-check its param caches by device-pointer identity.
+        Leave `False` (the safe default) whenever A/B may change between calls.
 
     Returns
     -------
@@ -307,6 +313,7 @@ def update_posterior_policies(
                 use_param_info_gain=use_param_info_gain,
                 use_inductive=False,
                 inductive_epsilon=eps_dummy,
+                ffi_cache_params_static=ffi_cache_params_static,
             )
 
         neg_efe_all_policies = _ffi.with_jax_grad(_ffi_neg_efe, _jax_neg_efe)(
@@ -803,6 +810,7 @@ def update_posterior_policies_inductive(
     use_states_info_gain: bool = True,
     use_param_info_gain: bool = False,
     use_inductive: bool = True,
+    ffi_cache_params_static: bool = False,
 ) -> tuple[Array, Array]:
     """
     Compute policy posterior and negative expected free energy with optional
@@ -851,6 +859,12 @@ def update_posterior_policies_inductive(
         Include epistemic parameter-information gain term.
     use_inductive: bool = True
         Include inductive value term.
+    ffi_cache_params_static: bool = False
+        FFI-only cache hint, ignored by the JAX reference path. When `True` the
+        caller guarantees A/B are not mutated in place across calls, letting the
+        CUDA-Dev kernel warm-check its param caches by device-pointer identity.
+        Leave `False` (the safe default) whenever A/B may change between calls
+        (e.g. online learning), which forces a per-call cache rebuild.
 
     Returns
     -------
@@ -910,6 +924,7 @@ def update_posterior_policies_inductive(
                 use_param_info_gain=use_param_info_gain,
                 use_inductive=use_inductive,
                 inductive_epsilon=eps,
+                ffi_cache_params_static=ffi_cache_params_static,
             )
 
         neg_efe_all_policies = _ffi.with_jax_grad(_ffi_neg_efe, _jax_neg_efe)(
